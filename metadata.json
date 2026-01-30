@@ -1,0 +1,9 @@
+{
+  "name": "Vision OS",
+  "description": "Multi-modal AI assistant with video HUD, continuous audio, and multiplayer interaction.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
