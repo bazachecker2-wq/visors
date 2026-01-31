@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AUDIO_WORKLET_CODE, float32ToInt16, base64ToUint8Array, decodeAudioData, downsampleBuffer, arrayBufferToBase64 } from "../utils/audioUtils";
 import { ConnectionStatus, Marker, CameraCommand } from "../types";
@@ -16,46 +15,54 @@ export class GeminiService {
   
   // Audio Queue Management
   private nextStartTime: number = 0;
-  private activeSources: AudioBufferSourceNode[] = []; 
-  private currentTurnVersion = 0; // To invalidate stale async audio
+  private activeSources: { source: AudioBufferSourceNode, gain: GainNode }[] = []; 
+  private currentTurnVersion = 0; 
+  private processingQueue: Promise<void> = Promise.resolve(); 
 
   private apiKey: string;
   private shouldReconnect = true;
   private reconnectAttempts = 0;
   
-  // Audio Buffering State
   private inputBuffer: Float32Array = new Float32Array(0);
-  // Reduced chunk size for faster interruption detection (64ms @ 16kHz)
   private readonly CHUNK_SIZE = 1024; 
   
-  // Voice Activity Detection (Noise Gate)
-  private readonly NOISE_THRESHOLD = 0.005; 
-  private silenceCounter = 0;
+  private currentUserTranscript = "";
+  private currentAiTranscript = "";
+  
+  // Commands that trigger immediate stop
+  private readonly STOP_KEYWORDS = ['стоп', 'стой', 'остановись', 'хватит', 'тихо', 'замолчи'];
 
   public onStatusChange: (status: ConnectionStatus) => void = () => {};
   public onAudioLevel: (level: number) => void = () => {};
   public onMarkerUpdate: (markers: Marker[], action: string) => void = () => {};
-  public onTranscript: (text: string, isFinal: boolean) => void = () => {};
+  public onTranscript: (text: string, source: 'user' | 'ai', isFinal: boolean) => void = () => {};
   public onCameraCommand: (cmd: CameraCommand) => void = () => {};
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
+  constructor() {
+    this.apiKey = process.env.API_KEY || '';
     if (this.apiKey) {
         this.ai = new GoogleGenAI({ apiKey: this.apiKey });
     }
   }
 
-  public updateApiKey(key: string) {
-    this.apiKey = key;
-    this.ai = new GoogleGenAI({ apiKey: this.apiKey });
-  }
-
   public async connect() {
     this.shouldReconnect = true;
+    this.currentUserTranscript = "";
+    this.currentAiTranscript = "";
     
-    if (this.apiKey) {
-        this.ai = new GoogleGenAI({ apiKey: this.apiKey });
-    } else {
+    try {
+        this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ 
+            sampleRate: 24000,
+            latencyHint: 'interactive'
+        });
+        if (this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+        }
+    } catch (e) {
+        console.error("AudioContext Init Error:", e);
+    }
+
+    if (!this.ai) {
         this.onStatusChange(ConnectionStatus.ERROR);
         return;
     }
@@ -63,8 +70,6 @@ export class GeminiService {
     this.onStatusChange(ConnectionStatus.CONNECTING);
 
     try {
-      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      
       const config = {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
@@ -77,26 +82,21 @@ export class GeminiService {
         },
         config: {
             responseModalities: [Modality.AUDIO], 
-            systemInstruction: `Ты VisionOS (Вижн ОС). Тактический ИИ костюма. 
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction: `Ты — тактический ИИ "VisionOS". 
             
-            ИНСТРУМЕНТЫ (ВЫЗЫВАЙ ЧЕРЕЗ XML):
-            1. Управление камерой (Zoom):
-               <call:camera_zoom {"level": 1.0} /> (Норма)
-               <call:camera_zoom {"level": 2.0} /> (Увеличение x2)
-               <call:camera_zoom {"level": 3.0} /> (Максимум x3)
-            
-            2. Фильтрация целей (Сегментация):
-               <call:set_filter {"type": "all"} /> (Показать всё)
-               <call:set_filter {"type": "person"} /> (Только люди/живая сила)
-               <call:set_filter {"type": "vehicle"} /> (Только техника)
+            ТВОИ ЗАДАЧИ:
+            1. Визуальный анализ: Используй видеопоток, чтобы понимать контекст.
+            2. Стиль: Краткий, четкий, профессиональный. Используй термины: "Цель", "Объект", "Вероятно", "Угроза".
+            3. Язык: ТОЛЬКО РУССКИЙ.
+            4. РЕЧЕВОЙ ПРОТОКОЛ: Твоя речь должна быть непрерывной. Если ты слышишь шум или голос пользователя, НЕ ПРЕРЫВАЙСЯ и НЕ ОСТАНАВЛИВАЙСЯ, пока тебя не попросят замолчать командами "Стоп" или "Стой".
 
-            ИНСТРУКЦИЯ:
-            1. Язык общения: ТОЛЬКО РУССКИЙ.
-            2. Отвечай мгновенно. Не жди длинных пауз.
-            3. Стиль: Военный, четкий, механический. Без лирики.
-            4. СРАЗУ ПОСЛЕ ПОДКЛЮЧЕНИЯ скажи: "VisionOS онлайн. Жду команд."
-            5. Если оператор просит "увеличить", "зум", "ближе" - используй camera_zoom.
-            6. Если оператор просит "показать людей", "выделить цели", "убрать мусор" - используй set_filter.`,
+            ИНСТРУМЕНТЫ:
+            - <call:camera_zoom {"level": 2.0} />
+            - <call:set_filter {"type": "person"} />
+            
+            ВАЖНО: Никогда не отправляй "технический" текст анализа изображения в ответ. Только реплики диалога.`,
             speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
             }
@@ -136,10 +136,7 @@ export class GeminiService {
     }
     
     const baseDelay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
-    const jitter = Math.random() * 1000;
-    const delay = baseDelay + jitter;
-
-    console.log(`Reconnecting in ${Math.round(delay)}ms...`);
+    const delay = baseDelay + (Math.random() * 1000);
 
     setTimeout(() => {
         this.reconnectAttempts++;
@@ -148,85 +145,129 @@ export class GeminiService {
   }
 
   private async handleMessage(message: LiveServerMessage) {
-    // 1. Handle Interruption
+    // 1. Check server interruption signal
+    // We intentionally IGNORE generic server interruptions to support continuous speech over noise.
+    // We only respect interruptions if we detect a stop command in the transcript below.
     if (message.serverContent?.interrupted) {
-        console.log("VisionOS: Interrupted by operator");
-        this.stopAllAudio();
+        console.log("VisionOS: Server signaled interruption (Ignored for continuous flow)");
+        // If we wanted to stop on ANY noise, we would call this.stopAllAudio() here.
+        // But we don't. We let the buffer finish.
         return;
     }
 
-    // 2. Audio Output
     const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
     if (audioData && this.audioContext) {
-      this.scheduleAudioChunk(audioData);
+      this.processingQueue = this.processingQueue
+        .then(() => this.scheduleAudioChunk(audioData))
+        .catch(e => console.error("Audio scheduling error", e));
     }
 
-    // 3. Text & Tools
-    const parts = message.serverContent?.modelTurn?.parts;
-    if (parts) {
-        parts.forEach((part: any) => {
-            if (part.text) {
-                this.parseHeuristicToolCalls(part.text);
-                const cleanText = part.text.replace(TOOL_CALL_REGEX, '').trim();
-                if (cleanText) this.onTranscript(cleanText, true); 
+    const serverContent = message.serverContent;
+    if (serverContent) {
+        if (serverContent.outputTranscription?.text) {
+             const text = serverContent.outputTranscription.text;
+             this.parseHeuristicToolCalls(text);
+             this.currentAiTranscript += text;
+             this.onTranscript(this.currentAiTranscript, 'ai', false);
+        }
+        
+        if (serverContent.inputTranscription?.text) {
+             const text = serverContent.inputTranscription.text;
+             this.currentUserTranscript += text;
+             this.onTranscript(this.currentUserTranscript, 'user', false);
+
+             // KEYWORD DETECTION: STOP COMMANDS
+             // If we detect a stop word, we immediately kill the audio buffer.
+             const lowerText = text.toLowerCase();
+             const isStopCommand = this.STOP_KEYWORDS.some(keyword => lowerText.includes(keyword));
+             
+             if (isStopCommand) {
+                 console.log("VisionOS: STOP COMMAND DETECTED");
+                 this.stopAllAudio();
+                 this.processingQueue = Promise.resolve(); // Clear scheduling queue
+                 // Optionally clear transcript to show acknowledgment
+                 if (this.currentAiTranscript) {
+                     this.onTranscript(this.currentAiTranscript, 'ai', true);
+                     this.currentAiTranscript = "";
+                 }
+             }
+        }
+
+        if (serverContent.turnComplete) {
+            // Finalize User Transcript if any
+            if (this.currentUserTranscript.trim()) {
+                this.onTranscript(this.currentUserTranscript, 'user', true);
             }
-        });
+            this.currentUserTranscript = "";
+
+            // Finalize AI Transcript if any (This triggers the fade-out in UI)
+            if (this.currentAiTranscript.trim()) {
+                this.onTranscript(this.currentAiTranscript, 'ai', true);
+            }
+            this.currentAiTranscript = "";
+        }
     }
   }
 
   private stopAllAudio() {
-      // Invalidate any audio currently decoding
       this.currentTurnVersion++;
-
-      this.activeSources.forEach(source => {
-          try { source.stop(); } catch(e) {}
+      this.activeSources.forEach(({ source, gain }) => {
+          try { 
+              const currTime = this.audioContext?.currentTime || 0;
+              gain.gain.cancelScheduledValues(currTime);
+              gain.gain.setValueAtTime(gain.gain.value, currTime);
+              // Faster fade out for stop commands (0.05s)
+              gain.gain.linearRampToValueAtTime(0, currTime + 0.05); 
+              source.stop(currTime + 0.05); 
+          } catch(e) {}
       });
       this.activeSources = [];
       
       if (this.audioContext) {
-          this.nextStartTime = this.audioContext.currentTime;
+          this.nextStartTime = this.audioContext.currentTime + 0.05;
       }
   }
 
   private async scheduleAudioChunk(base64Data: string) {
-    // Capture version before async op
     const localVersion = this.currentTurnVersion;
-    
     if (!this.audioContext) return;
+
     try {
         const audioBytes = base64ToUint8Array(base64Data);
         const buffer = await decodeAudioData(audioBytes, this.audioContext, 24000);
         
-        // Check if interrupted during decode
-        if (localVersion !== this.currentTurnVersion) {
-            return;
-        }
+        if (localVersion !== this.currentTurnVersion) return;
 
         const source = this.audioContext.createBufferSource();
+        const gainNode = this.audioContext.createGain();
+        
         source.buffer = buffer;
-        source.connect(this.audioContext.destination);
+        source.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
         
         const currentTime = this.audioContext.currentTime;
         
-        // Strict timing to avoid overlap
+        // GAPLESS PLAYBACK FIX
         if (this.nextStartTime < currentTime) {
-            this.nextStartTime = currentTime + 0.02; // Minimal buffer
-        } 
-        // If drift is too large, snap back, but don't cut off unless huge
-        else if (this.nextStartTime > currentTime + 0.5) {
-             // If we are way ahead, it's fine, it just means we have a buffer.
+             this.nextStartTime = currentTime + 0.01;
         }
+
+        const startTime = this.nextStartTime;
         
-        source.start(this.nextStartTime);
+        gainNode.gain.setValueAtTime(1, startTime);
+        source.start(startTime);
+        
         this.nextStartTime += buffer.duration;
 
-        this.activeSources.push(source);
+        const sourceObj = { source, gain: gainNode };
+        this.activeSources.push(sourceObj);
+        
         source.onended = () => {
-            this.activeSources = this.activeSources.filter(s => s !== source);
+            this.activeSources = this.activeSources.filter(s => s !== sourceObj);
         };
 
     } catch (e) {
-        // Ignore decode errors
+        console.error("Error scheduling audio chunk", e);
     }
   }
 
@@ -243,10 +284,6 @@ export class GeminiService {
                 this.onCameraCommand({ type: 'zoom', value: payload.level || 1 });
             } else if (funcName === 'set_filter') {
                 this.onCameraCommand({ type: 'filter', value: payload.type || 'all' });
-            } else if (payload.markers) {
-                // Legacy support for direct marker injection (if needed)
-                const aiMarkers = payload.markers.map((m: any) => ({ ...m, source: 'ai' }));
-                this.onMarkerUpdate(aiMarkers, payload.action || 'add');
             }
         } catch (e) { /* Safe fail */ }
     }
@@ -254,6 +291,11 @@ export class GeminiService {
 
   private async startAudioInput() {
     try {
+      if (!this.audioContext) return;
+      if (this.audioContext.state === 'suspended') {
+          await this.audioContext.resume();
+      }
+
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: {
           channelCount: 1,
           sampleRate: 16000,
@@ -262,29 +304,25 @@ export class GeminiService {
           autoGainControl: true
       }});
       
-      if (!this.audioContext) return;
 
       const source = this.audioContext.createMediaStreamSource(this.stream);
       this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 128;
+      this.analyser.fftSize = 256;
+      this.analyser.smoothingTimeConstant = 0.3; 
       this.frequencyData = new Uint8Array(this.analyser.frequencyBinCount);
 
       const blob = new Blob([AUDIO_WORKLET_CODE], { type: 'application/javascript' });
       const workletUrl = URL.createObjectURL(blob);
+      
       await this.audioContext.audioWorklet.addModule(workletUrl);
-
+      
       this.inputWorklet = new AudioWorkletNode(this.audioContext, 'mic-processor');
       this.inputWorklet.port.onmessage = (event) => {
         const inputData = event.data as Float32Array;
-        
-        // 1. Calculate RMS Level
         let sum = 0;
-        for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
-        const rms = Math.sqrt(sum / inputData.length);
-        
-        this.onAudioLevel(rms * 50); 
-
-        // 2. Buffer & Send
+        for (let i = 0; i < inputData.length; i += 10) sum += inputData[i] * inputData[i];
+        const rms = Math.sqrt(sum / (inputData.length / 10));
+        this.onAudioLevel(rms * 100); 
         this.processInputAudio(inputData, rms);
       };
 
@@ -299,24 +337,18 @@ export class GeminiService {
 
   private processInputAudio(chunk: Float32Array, rms: number) {
       if (!this.audioContext) return;
-
-      // VAD
-      if (rms < this.NOISE_THRESHOLD) {
-          this.silenceCounter++;
-          if (this.silenceCounter > 10) return; 
-      } else {
-          this.silenceCounter = 0;
-      }
+      
+      // REMOVED LOCAL RMS-BASED BARGE-IN logic.
+      // We no longer stop audio based on volume threshold. 
+      // Only explicit stop commands (processed in handleMessage) will stop audio.
 
       const resampled = downsampleBuffer(chunk, this.audioContext.sampleRate, 16000);
-      
       const newBuffer = new Float32Array(this.inputBuffer.length + resampled.length);
       newBuffer.set(this.inputBuffer);
       newBuffer.set(resampled, this.inputBuffer.length);
       this.inputBuffer = newBuffer;
 
-      // Send smaller chunks for faster server-side VAD
-      if (this.inputBuffer.length >= this.CHUNK_SIZE) {
+      while (this.inputBuffer.length >= this.CHUNK_SIZE) {
           const chunkToSend = this.inputBuffer.slice(0, this.CHUNK_SIZE);
           this.inputBuffer = this.inputBuffer.slice(this.CHUNK_SIZE);
           
@@ -327,9 +359,7 @@ export class GeminiService {
                   this.session.sendRealtimeInput({ 
                       media: { mimeType: "audio/pcm;rate=16000", data: base64 } 
                   });
-              } catch (e) {
-                  console.warn("Gemini: Failed to send audio input");
-              }
+              } catch (e) { /* silent */ }
           }
       }
   }
@@ -348,9 +378,7 @@ export class GeminiService {
             this.session.sendRealtimeInput({
                 media: { mimeType: 'image/jpeg', data: base64Image }
             });
-        } catch (e) {
-            console.warn("Gemini: Failed to send video frame");
-        }
+        } catch (e) { /* silent */ }
     }
   }
 
@@ -363,6 +391,7 @@ export class GeminiService {
         this.audioContext = null;
     }
     this.session = null;
+    this.processingQueue = Promise.resolve();
     this.onStatusChange(ConnectionStatus.DISCONNECTED);
   }
 }

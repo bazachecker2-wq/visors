@@ -28,12 +28,13 @@ export interface Marker {
   y: number; // Percentage 0-100 or pixels (center)
   width?: number;
   height?: number;
-  shape?: 'box' | 'point' | 'skeleton';
+  shape?: 'box' | 'point' | 'skeleton' | 'face_mesh';
   color?: string; // hex or tailwind class ref
   distance?: number;
   source?: 'local' | 'ai'; // 'local' = COCO/Pose, 'ai' = Gemini
   confidence?: number;
   keypoints?: Keypoint[]; // For skeletons
+  contours?: Record<string, { x: number; y: number }[]>; // For face mesh
 }
 
 export interface ChatMessage {
