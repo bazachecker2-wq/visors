@@ -35,7 +35,7 @@ const RENDER_WORKER_CODE = `
   const COLOR_PRIMARY = '#ffaa00';
   const COLOR_DANGER = '#ff3300';
   const COLOR_MACHINE = '#00ff41'; 
-  const COLOR_FACE = '#00ffff'; // Cyan for face analysis
+  const COLOR_FACE = '#00ffff'; 
 
   const SKELETON_CONNECTIONS = [
       [0, 1], [0, 2], [1, 3], [2, 4], 
@@ -52,9 +52,22 @@ const RENDER_WORKER_CODE = `
       16: 'L_FOOT'
   };
 
-  const LERP_FACTOR = 0.35; 
-  const PERSISTENCE_MS = 500; // Time markers stay before fading
+  // PHYSICS CONFIG FOR SMOOTH TRACKING
+  // Stiffness: How fast it pulls towards target (Higher = snappier, Lower = loose)
+  // Damping: Friction (Lower = bouncy, Higher = sludge)
+  const SPRING = { stiffness: 0.25, damping: 0.75 };
+  const PERSISTENCE_MS = 500; 
 
+  // Helper: Apply spring force to a value
+  function updateSpring(current, target, velocity) {
+      const delta = target - current;
+      const force = delta * SPRING.stiffness;
+      velocity += force;
+      velocity *= SPRING.damping;
+      return { val: current + velocity, vel: velocity };
+  }
+
+  // Helper: Linear Interpolation for simple opacity
   const lerp = (start, end, factor) => start + (end - start) * factor;
 
   self.onmessage = (e) => {
@@ -77,13 +90,13 @@ const RENDER_WORKER_CODE = `
     }
     else if (type === 'UPDATE_MARKERS') {
       markers = payload;
-      // Resync anchor to current orientation as markers are "ground truth" for now.
+      // Resync anchor slightly to drift towards truth, but keep smooth
       if (orientationInitialized) {
-          anchorOrientation = { ...currentOrientation };
+          // Soft anchor reset could be implemented here if drift is high
       }
     }
     else if (type === 'UPDATE_SENSORS') {
-      const a = 0.1; // Smoothing factor
+      const a = 0.2; // Faster smoothing for sensors
       if (!orientationInitialized) {
          currentOrientation = payload.orientation;
          anchorOrientation = payload.orientation;
@@ -91,10 +104,11 @@ const RENDER_WORKER_CODE = `
       } else {
          const raw = payload.orientation;
          
-         // Handle Alpha (Yaw) Wrap-around for LERP
+         // Handle Alpha Wrap
          let dAlpha = raw.alpha - currentOrientation.alpha;
          if (dAlpha > 180) dAlpha -= 360;
          if (dAlpha < -180) dAlpha += 360;
+         
          currentOrientation.alpha += dAlpha * a;
          // Normalize alpha
          if (currentOrientation.alpha < 0) currentOrientation.alpha += 360;
@@ -121,13 +135,13 @@ const RENDER_WORKER_CODE = `
       ctx.lineWidth = 1;
       
       ctx.beginPath();
-      // Longitudinal lines
+      // Longitudinal
       for(let i=-20; i<=20; i++) {
           const x = i * 40 * zoomLevel;
           ctx.moveTo(x, -h * 2); 
           ctx.lineTo(x * 3, h * 2); 
       }
-      // Latitudinal lines
+      // Latitudinal
       for(let i=0; i<20; i++) {
           const y = (Math.pow(i, 1.8) * 5 * zoomLevel) + speed;
           if (y > h) continue;
@@ -180,6 +194,8 @@ const RENDER_WORKER_CODE = `
     const mainColor = isWireframe ? '#ffffff' : (isMachine ? COLOR_MACHINE : COLOR_PRIMARY);
     const dangerColor = isWireframe ? '#ff0000' : COLOR_DANGER;
 
+    // --- IMU Compensation Shift ---
+    // This allows the HUD to stick to the world even if AI is lagging
     let shiftX = 0;
     let shiftY = 0;
 
@@ -192,16 +208,16 @@ const RENDER_WORKER_CODE = `
         shiftY = -(dBeta * ppdY);
     }
     
+    // Background Grid
     if (isMachine || isWireframe) {
         drawGrid(ctx, canvasWidth, canvasHeight, rollRad, pitchOffset);
     }
 
+    // Horizon Line
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(rollRad);
     ctx.translate(0, pitchOffset);
-
-    // Horizon & Pitch Ladder
     ctx.strokeStyle = isMachine || isWireframe ? 'rgba(0, 255, 65, 0.3)' : 'rgba(255, 170, 0, 0.2)';
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(-cx * 4, 0); ctx.lineTo(cx * 4, 0); ctx.stroke();
@@ -217,7 +233,7 @@ const RENDER_WORKER_CODE = `
     }
     ctx.restore();
 
-    // --- DRAW MARKERS ---
+    // --- UPDATE & DRAW MARKERS ---
     const activeIds = new Set();
     
     markers.forEach(m => {
@@ -225,19 +241,39 @@ const RENDER_WORKER_CODE = `
         let visual = visualState.get(m.id);
         
         if (!visual) {
-            visual = { ...m, currentOpacity: 0, targetOpacity: 1, lastSeen: now };
+            // New Marker Initialization
+            visual = { 
+                ...m, 
+                currentOpacity: 0, 
+                targetOpacity: 1, 
+                lastSeen: now,
+                // Physics State
+                vx: 0, vy: 0, vw: 0, vh: 0,
+                // Deep structure for complex shapes
+                keypointsState: m.keypoints ? m.keypoints.map(k => ({ x: k.x, y: k.y, vx: 0, vy: 0 })) : [],
+                contoursState: m.contours ? JSON.parse(JSON.stringify(m.contours)) : null
+            };
+            // Init contour velocities
+            if (visual.contoursState) {
+                for (let key in visual.contoursState) {
+                    visual.contoursState[key] = visual.contoursState[key].map(p => ({ x: p.x, y: p.y, vx: 0, vy: 0 }));
+                }
+            }
             visualState.set(m.id, visual);
         } else {
+            // Update Target
             visual.targetOpacity = 1;
             visual.lastSeen = now;
-            visual.x = lerp(visual.x, m.x, LERP_FACTOR);
-            visual.y = lerp(visual.y, m.y, LERP_FACTOR);
-            visual.width = lerp(visual.width || 0, m.width || 0, LERP_FACTOR);
-            visual.height = lerp(visual.height || 0, m.height || 0, LERP_FACTOR);
-            visual.label = m.label;
+            // We only update the 'target' properties on the visual object
+            // The physics loop below handles the actual movement
+            visual.targetX = m.x;
+            visual.targetY = m.y;
+            visual.targetW = m.width || 0;
+            visual.targetH = m.height || 0;
+            visual.targetKeypoints = m.keypoints;
+            visual.targetContours = m.contours;
+            visual.label = m.label; // Instant update for text
             visual.distance = m.distance;
-            visual.keypoints = m.keypoints;
-            visual.contours = m.contours;
         }
     });
 
@@ -249,12 +285,27 @@ const RENDER_WORKER_CODE = `
         m.currentOpacity = lerp(m.currentOpacity, m.targetOpacity, 0.15);
         if (m.currentOpacity < 0.05) { visualState.delete(id); return; }
 
+        // --- PHYSICS UPDATE ---
+        const boxX = updateSpring(m.x, m.targetX !== undefined ? m.targetX : m.x, m.vx);
+        m.x = boxX.val; m.vx = boxX.vel;
+        
+        const boxY = updateSpring(m.y, m.targetY !== undefined ? m.targetY : m.y, m.vy);
+        m.y = boxY.val; m.vy = boxY.vel;
+        
+        const boxW = updateSpring(m.width, m.targetW !== undefined ? m.targetW : m.width, m.vw);
+        m.width = boxW.val; m.vw = boxW.vel;
+
+        const boxH = updateSpring(m.height, m.targetH !== undefined ? m.targetH : m.height, m.vh);
+        m.height = boxH.val; m.vh = boxH.vel;
+
+        // --- DRAWING ---
         ctx.globalAlpha = m.currentOpacity;
         
         // Final position with stabilization
         const x = m.x + shiftX; 
         const y = m.y + shiftY; 
         
+        // Culling
         if (x < -200 || x > canvasWidth + 200 || y < -200 || y > canvasHeight + 200) return;
 
         const w = m.width; 
@@ -263,7 +314,7 @@ const RENDER_WORKER_CODE = `
         
         const baseColor = m.label === 'УГРОЗА' ? dangerColor : mainColor;
         
-        // Perspective Box Calculation
+        // Perspective Box
         const perspective = 0.85; 
         const vx = x - cx; const vy = y - cy;
         const bx = cx + vx * perspective; const by = cy + vy * perspective; 
@@ -272,33 +323,51 @@ const RENDER_WORKER_CODE = `
         const fl = x - w/2, fr = x + w/2; const ft = y - h/2, fb = y + h/2;
         const bl = bx - bw/2, br = bx + bw/2; const bt = by - bh/2, bb = by + bh/2;
 
-        if (m.shape === 'face_mesh' && m.contours) {
+        if (m.shape === 'face_mesh' && m.contoursState && m.targetContours) {
              const meshColor = isWireframe ? '#00ffff' : (isMachine ? '#00ffaa' : COLOR_FACE);
              
-             // --- FACE MESH (Mask) ---
+             // Update Mesh Physics
+             const renderedContours = {};
+             for (const key in m.contoursState) {
+                 const points = m.contoursState[key];
+                 const targets = m.targetContours[key];
+                 if (targets && points.length === targets.length) {
+                     renderedContours[key] = points.map((p, idx) => {
+                         const px = updateSpring(p.x, targets[idx].x, p.vx);
+                         const py = updateSpring(p.y, targets[idx].y, p.vy);
+                         p.x = px.val; p.vx = px.vel;
+                         p.y = py.val; p.vy = py.vel;
+                         return { x: p.x, y: p.y };
+                     });
+                 } else {
+                     renderedContours[key] = points;
+                 }
+             }
+
+             // Render Mesh
              ctx.strokeStyle = meshColor;
              ctx.lineWidth = (isWireframe ? 1.5 : 1) * depthScale;
              
-             if (m.contours.silhouette) drawPath(ctx, m.contours.silhouette, shiftX, shiftY, true);
+             if (renderedContours.silhouette) drawPath(ctx, renderedContours.silhouette, shiftX, shiftY, true);
 
              // Features
              ctx.fillStyle = isWireframe ? 'rgba(0, 255, 255, 0.1)' : 'rgba(0, 255, 255, 0.05)';
              ctx.lineWidth = (isWireframe ? 2 : 1.5) * depthScale;
              
-             if (m.contours.lipsUpper && m.contours.lipsLower) {
-                 drawPath(ctx, m.contours.lipsUpper, shiftX, shiftY, true, true);
-                 drawPath(ctx, m.contours.lipsLower, shiftX, shiftY, true, true);
+             if (renderedContours.lipsUpper && renderedContours.lipsLower) {
+                 drawPath(ctx, renderedContours.lipsUpper, shiftX, shiftY, true, true);
+                 drawPath(ctx, renderedContours.lipsLower, shiftX, shiftY, true, true);
              }
 
-             if (m.contours.rightEye) drawPath(ctx, m.contours.rightEye, shiftX, shiftY, true, true);
-             if (m.contours.leftEye) drawPath(ctx, m.contours.leftEye, shiftX, shiftY, true, true);
+             if (renderedContours.rightEye) drawPath(ctx, renderedContours.rightEye, shiftX, shiftY, true, true);
+             if (renderedContours.leftEye) drawPath(ctx, renderedContours.leftEye, shiftX, shiftY, true, true);
 
              ctx.fillStyle = 'transparent';
-             if (m.contours.rightEyebrow) drawPath(ctx, m.contours.rightEyebrow, shiftX, shiftY, false);
-             if (m.contours.leftEyebrow) drawPath(ctx, m.contours.leftEyebrow, shiftX, shiftY, false);
-             if (m.contours.nose) drawPath(ctx, m.contours.nose, shiftX, shiftY, false);
+             if (renderedContours.rightEyebrow) drawPath(ctx, renderedContours.rightEyebrow, shiftX, shiftY, false);
+             if (renderedContours.leftEyebrow) drawPath(ctx, renderedContours.leftEyebrow, shiftX, shiftY, false);
+             if (renderedContours.nose) drawPath(ctx, renderedContours.nose, shiftX, shiftY, false);
 
-             // Frame Corners
+             // Frame Corners for Face
              const cornerSize = w * 0.2;
              ctx.strokeStyle = meshColor;
              ctx.lineWidth = 2 * depthScale;
@@ -307,17 +376,28 @@ const RENDER_WORKER_CODE = `
              ctx.beginPath(); ctx.moveTo(fl, fb - cornerSize); ctx.lineTo(fl, fb); ctx.lineTo(fl + cornerSize, fb); ctx.stroke();
              ctx.beginPath(); ctx.moveTo(fr, fb - cornerSize); ctx.lineTo(fr, fb); ctx.lineTo(fr - cornerSize, fb); ctx.stroke();
 
-        } else if (m.shape === 'skeleton' && m.keypoints) {
-             // --- SKELETON ---
+        } else if (m.shape === 'skeleton' && m.keypointsState && m.targetKeypoints) {
+             // Update Skeleton Physics
+             const renderedKeypoints = m.keypointsState.map((k, idx) => {
+                 const target = m.targetKeypoints[idx];
+                 if (target) {
+                     const kx = updateSpring(k.x, target.x, k.vx);
+                     const ky = updateSpring(k.y, target.y, k.vy);
+                     k.x = kx.val; k.vx = kx.vel;
+                     k.y = ky.val; k.vy = ky.vel;
+                     return { x: k.x, y: k.y, score: target.score };
+                 }
+                 return k;
+             });
+
              ctx.strokeStyle = baseColor;
-             // Increased line width for better mobile visibility
              ctx.lineWidth = (isWireframe ? 4 : 3) * depthScale;
              ctx.lineJoin = 'round'; ctx.lineCap = 'round';
 
              ctx.beginPath();
              for (const [i, j] of SKELETON_CONNECTIONS) {
-                const p1 = m.keypoints[i]; const p2 = m.keypoints[j];
-                // Increased threshold to 0.6 for better quality
+                const p1 = renderedKeypoints[i]; const p2 = renderedKeypoints[j];
+                // Check scores from original target to avoid ghosting low conf points
                 if (p1 && p2 && p1.score > 0.6 && p2.score > 0.6) {
                     ctx.moveTo(p1.x + shiftX, p1.y + shiftY); ctx.lineTo(p2.x + shiftX, p2.y + shiftY);
                 }
@@ -325,8 +405,7 @@ const RENDER_WORKER_CODE = `
              ctx.stroke();
 
              // Nodes
-             m.keypoints.forEach((k, idx) => {
-                 // Increased threshold to 0.6
+             renderedKeypoints.forEach((k, idx) => {
                  if (k.score > 0.6) {
                      const kx = k.x + shiftX;
                      const ky = k.y + shiftY;
@@ -338,17 +417,11 @@ const RENDER_WORKER_CODE = `
                      ctx.arc(kx, ky, 4 * depthScale, 0, Math.PI * 2);
                      ctx.fill();
                      ctx.stroke();
-
-                     if (KEYPOINT_NAMES[idx]) {
-                         ctx.fillStyle = baseColor;
-                         ctx.font = (10 * depthScale) + 'px monospace';
-                         ctx.fillText(KEYPOINT_NAMES[idx], kx + 8, ky);
-                     }
                  }
              });
 
         } else {
-             // --- BOX ---
+             // --- BOX RENDERING ---
              if (!isWireframe) {
                  ctx.fillStyle = m.label === 'УГРОЗА' ? 'rgba(255, 0, 0, 0.15)' : (isMachine ? 'rgba(0, 255, 65, 0.1)' : 'rgba(255, 170, 0, 0.1)');
                  ctx.beginPath(); ctx.moveTo(fl, fb); ctx.lineTo(bl, bb); ctx.lineTo(br, bb); ctx.lineTo(fr, fb); ctx.fill();

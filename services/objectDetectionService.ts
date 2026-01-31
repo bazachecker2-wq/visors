@@ -1,4 +1,3 @@
-
 import { Marker } from '../types';
 
 // --- WORKER CODE AS STRING ---
@@ -241,6 +240,98 @@ export class ObjectDetectionService {
 
   private currentVideoWidth = 1;
   private currentVideoHeight = 1;
+
+  // Real-world height estimates (in meters) for distance calculation
+  private readonly OBJECT_HEIGHTS: Record<string, number> = {
+      // COCO SSD Labels
+      'person': 1.7,
+      'bicycle': 1.0,
+      'car': 1.5,
+      'motorcycle': 1.1,
+      'airplane': 10.0,
+      'bus': 3.2,
+      'train': 4.0,
+      'truck': 3.5,
+      'boat': 2.0,
+      'traffic light': 0.8,
+      'fire hydrant': 0.6,
+      'stop sign': 0.9,
+      'parking meter': 1.2,
+      'bench': 0.5,
+      'bird': 0.2,
+      'cat': 0.3,
+      'dog': 0.6,
+      'horse': 1.6,
+      'sheep': 0.8,
+      'cow': 1.4,
+      'elephant': 3.0,
+      'bear': 1.2,
+      'zebra': 1.4,
+      'giraffe': 5.0,
+      'backpack': 0.5,
+      'umbrella': 0.5,
+      'handbag': 0.3,
+      'tie': 0.5,
+      'suitcase': 0.6,
+      'frisbee': 0.3,
+      'skis': 1.8,
+      'snowboard': 1.5,
+      'sports ball': 0.25,
+      'kite': 0.5,
+      'baseball bat': 0.9,
+      'baseball glove': 0.3,
+      'skateboard': 0.2,
+      'surfboard': 2.0,
+      'tennis racket': 0.7,
+      'bottle': 0.25,
+      'wine glass': 0.2,
+      'cup': 0.15,
+      'fork': 0.2,
+      'knife': 0.2,
+      'spoon': 0.15,
+      'bowl': 0.15,
+      'banana': 0.2,
+      'apple': 0.1,
+      'sandwich': 0.1,
+      'orange': 0.1,
+      'broccoli': 0.15,
+      'carrot': 0.15,
+      'hot dog': 0.15,
+      'pizza': 0.3,
+      'donut': 0.1,
+      'cake': 0.2,
+      'chair': 1.0,
+      'couch': 0.9,
+      'potted plant': 0.5,
+      'bed': 0.6,
+      'dining table': 0.75,
+      'toilet': 0.5,
+      'tv': 0.6,
+      'laptop': 0.3,
+      'mouse': 0.05,
+      'remote': 0.2,
+      'keyboard': 0.03,
+      'cell phone': 0.15,
+      'microwave': 0.35,
+      'oven': 0.8,
+      'toaster': 0.25,
+      'sink': 0.2,
+      'refrigerator': 1.7,
+      'book': 0.25,
+      'clock': 0.3,
+      'vase': 0.4,
+      'scissors': 0.2,
+      'teddy bear': 0.5,
+      'hair drier': 0.25,
+      'toothbrush': 0.18,
+      
+      // Custom Labels from Worker
+      'лицо': 0.25, // Face
+      'речь': 0.25, // Talking face
+      'тело': 1.7   // Pose body
+  };
+  
+  private readonly DEFAULT_HEIGHT = 1.0;
   
   public onProgress: (label: string, value: number) => void = () => {};
 
@@ -281,7 +372,8 @@ export class ObjectDetectionService {
     if (!this.worker) return this.lastMarkers;
 
     const now = Date.now();
-    if (now - this.lastProcessedTime < 60) return this.lastMarkers;
+    // Throttle reduced to 10ms (virtually uncapped, limited by processing speed)
+    if (now - this.lastProcessedTime < 10) return this.lastMarkers;
 
     if (!this.isBusy) {
         try {
@@ -309,21 +401,25 @@ export class ObjectDetectionService {
   }
 
   private processRawMarkers(normalizedMarkers: Marker[]): Marker[] {
-    return normalizedMarkers.map(m => ({
-        ...m,
-        label: this.translateLabel(m.label),
-        x: m.x * this.currentVideoWidth,
-        y: m.y * this.currentVideoHeight,
-        width: (m.width || 0) * this.currentVideoWidth,
-        height: (m.height || 0) * this.currentVideoHeight,
-        keypoints: m.keypoints?.map(k => ({
-            ...k,
-            x: k.x * this.currentVideoWidth,
-            y: k.y * this.currentVideoHeight
-        })),
-        contours: m.contours ? this.processContours(m.contours) : undefined,
-        distance: this.calculateDistance((m.height || 0) * this.currentVideoHeight) 
-    }));
+    return normalizedMarkers.map(m => {
+        const denormHeight = (m.height || 0) * this.currentVideoHeight;
+        
+        return {
+            ...m,
+            label: this.translateLabel(m.label),
+            x: m.x * this.currentVideoWidth,
+            y: m.y * this.currentVideoHeight,
+            width: (m.width || 0) * this.currentVideoWidth,
+            height: denormHeight,
+            keypoints: m.keypoints?.map(k => ({
+                ...k,
+                x: k.x * this.currentVideoWidth,
+                y: k.y * this.currentVideoHeight
+            })),
+            contours: m.contours ? this.processContours(m.contours) : undefined,
+            distance: this.calculateDistance(m.label, denormHeight) // Use original label for lookup
+        };
+    });
   }
 
   private processContours(rawContours: any): any {
@@ -337,12 +433,22 @@ export class ObjectDetectionService {
       return processed;
   }
 
-  private calculateDistance(bboxHeightPixels: number): number {
-      const normalizedHeight = (bboxHeightPixels / this.currentVideoHeight) * 720;
-      const ratio = normalizedHeight / 720; 
-      if (ratio <= 0) return 0;
-      const dist = 1.0 / ratio; 
-      return parseFloat(dist.toFixed(1));
+  private calculateDistance(label: string, bboxHeightPixels: number): number {
+      if (bboxHeightPixels <= 0) return 0;
+      
+      const realHeight = this.OBJECT_HEIGHTS[label.toLowerCase()] || this.DEFAULT_HEIGHT;
+      
+      // Estimated Focal Length in pixels
+      // Assuming a vertical Field of View (FOV) of approx 45 degrees for standard webcams/phones.
+      // f_pixel = (ImageHeight / 2) / tan(FOV_vertical / 2)
+      // tan(22.5) ~ 0.414
+      // f_pixel = (H / 2) / 0.414 = H * 1.2
+      const fPixels = this.currentVideoHeight * 1.2; 
+      
+      // Distance = (RealHeight * FocalLength) / ObjectHeight_pixels
+      const distance = (realHeight * fPixels) / bboxHeightPixels;
+      
+      return parseFloat(distance.toFixed(1));
   }
 
   private translateLabel(englishLabel: string): string {
