@@ -2,7 +2,7 @@
 export interface Player {
   id: string;
   name: string;
-  peerId?: string; // For WebRTC
+  peerId?: string;
   lastSeen: number;
   location?: {
     lat: number;
@@ -24,17 +24,25 @@ export interface Keypoint {
 export interface Marker {
   id: string;
   label: string;
-  x: number; // Percentage 0-100 or pixels (center)
-  y: number; // Percentage 0-100 or pixels (center)
+  activity?: string;
+  x: number; 
+  y: number; 
   width?: number;
   height?: number;
   shape?: 'box' | 'point' | 'skeleton' | 'face_mesh';
-  color?: string; // hex or tailwind class ref
+  color?: string;
   distance?: number;
-  source?: 'local' | 'ai'; // 'local' = COCO/Pose, 'ai' = Gemini
+  source?: 'local' | 'ai' | 'manual';
   confidence?: number;
-  keypoints?: Keypoint[]; // For skeletons
-  contours?: Record<string, { x: number; y: number }[]>; // For face mesh
+  keypoints?: Keypoint[];
+  contours?: Record<string, { x: number; y: number }[]>;
+  detailLevel?: number;
+  lastUpdated?: number;
+  velocity?: { x: number; y: number; z: number };
+  acceleration?: number;
+  speed?: number; 
+  predictedX?: number;
+  predictedY?: number;
 }
 
 export interface ChatMessage {
@@ -46,10 +54,6 @@ export interface ChatMessage {
   isSystem?: boolean;
 }
 
-export interface DirectMessage extends ChatMessage {
-  targetId: string;
-}
-
 export enum ConnectionStatus {
   DISCONNECTED = 'ОТКЛЮЧЕНО',
   CONNECTING = 'ПОДКЛЮЧЕНИЕ',
@@ -57,18 +61,7 @@ export enum ConnectionStatus {
   ERROR = 'ОШИБКА',
 }
 
-export interface AppConfig {
-  geminiApiKey: string;
-  pocketBaseUrl: string;
-}
-
-// Tool Call Structure
-export interface ToolCallPayload {
-  action: 'add' | 'remove' | 'clear' | 'update';
-  markers?: Marker[];
-}
-
 export interface CameraCommand {
-  type: 'zoom' | 'filter';
-  value: number | string; // zoom level (1-3) or filter type ('all', 'person', 'vehicle')
+  type: 'zoom' | 'filter' | 'activity' | 'marker_add' | 'marker_mod' | 'marker_rem';
+  value: any;
 }

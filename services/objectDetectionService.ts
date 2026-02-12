@@ -1,481 +1,290 @@
-import { Marker } from '../types';
 
-// --- WORKER CODE AS STRING ---
+import { Marker, Keypoint } from '../types';
+
 const WORKER_CODE = `
-  // Use specific versions to ensure compatibility between tfjs core and models
-  importScripts('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js');
-  importScripts('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js');
-  importScripts('https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js');
-  importScripts('https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@0.0.3/dist/face-landmarks-detection.js');
+  const scripts = [
+    'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js',
+    'https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js',
+    'https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js',
+    'https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@0.0.3/dist/face-landmarks-detection.js'
+  ];
 
-  let objectModel = null;
-  let poseDetector = null;
-  let faceModel = null;
-  
-  let isLoaded = false;
-  let isLoading = false;
+  try {
+    scripts.forEach(s => importScripts(s));
+  } catch (e) {
+    console.error("Worker Script Loading Error", e);
+  }
 
-  // Standard MediaPipe FaceMesh Topology Indices
-  const FACE_TOPOLOGY = {
-      lipsUpper: [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291],
-      lipsLower: [146, 91, 181, 84, 17, 314, 405, 321, 375, 291],
-      rightEye: [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
-      leftEye: [263, 249, 390, 373, 374, 380, 381, 382, 362, 466, 388, 387, 386, 385, 384, 398],
-      rightEyebrow: [70, 63, 105, 66, 107, 55, 65, 52, 53, 46],
-      leftEyebrow: [336, 296, 334, 293, 300, 276, 283, 282, 295, 285],
-      silhouette: [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109],
-      nose: [168, 6, 197, 195, 5, 4, 1, 19, 94, 2]
+  const TRANSLATIONS = {
+    'person': 'ЧЕЛОВЕК', 'bicycle': 'ВЕЛОСИПЕД', 'car': 'АВТО', 'motorcycle': 'МОТОЦИКЛ',
+    'bus': 'АВТОБУС', 'truck': 'ГРУЗОВИК', 'backpack': 'РЮКЗАК', 'handbag': 'СУМКА',
+    'cell phone': 'ТЕЛЕФОН', 'laptop': 'НОУТБУК', 'mouse': 'МЫШЬ', 'keyboard': 'КЛАВИАТУРА',
+    'bottle': 'БУТЫЛКА', 'cup': 'ЧАШКА', 'chair': 'СТУЛ', 'table': 'СТОЛ', 'tv': 'ЭКРАН',
+    'dog': 'СОБАКА', 'cat': 'КОШКА'
   };
 
-  const initModels = async () => {
-    if (isLoading || isLoaded) return;
-    isLoading = true;
+  let objectModel = null, poseDetector = null, faceModel = null, isLoaded = false;
 
+  const init = async () => {
     try {
-      // 1. TF Init
-      postMessage({ type: 'PROGRESS', label: 'NEURAL_KERNEL', value: 0.1 });
-      
-      if (typeof tf === 'undefined') {
-          throw new Error("TensorFlow JS failed to load via importScripts");
-      }
-
-      tf.env().set('WEBGL_PACK', false); 
+      tf.env().set('WEBGL_PACK', false);
       await tf.setBackend('webgl');
-      await tf.ready();
-      
-      console.log("Worker: TF Backend Ready (" + tf.getBackend() + ")");
-      postMessage({ type: 'PROGRESS', label: 'KERNEL_READY', value: 0.2 });
-
-      // 2. PARALLEL LOADING
-      // Start all model loads simultaneously
-      
-      const pFace = faceLandmarksDetection.load(
-        faceLandmarksDetection.SupportedPackages.mediapipeFacemesh,
-        { maxFaces: 1 }
-      ).then(m => {
-          faceModel = m;
-          postMessage({ type: 'PROGRESS', label: 'FACE_MESH_OK', value: 0.5 });
-      }).catch(e => console.error("FaceMesh Error:", e));
-
-      const pCoco = cocoSsd.load({ base: 'lite_mobilenet_v2' })
-      .then(m => {
-          objectModel = m;
-          postMessage({ type: 'PROGRESS', label: 'OBJ_DETECTOR_OK', value: 0.7 });
-      }).catch(e => console.warn("COCO Error:", e));
-
-      const pPose = poseDetection.createDetector(
-          poseDetection.SupportedModels.MoveNet, 
-          { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
-      ).then(m => {
-          poseDetector = m;
-          postMessage({ type: 'PROGRESS', label: 'POSE_ESTIMATOR_OK', value: 0.9 });
-      }).catch(e => console.error("Pose Error:", e));
-
-      // Wait for all to finish (success or fail)
-      await Promise.all([pFace, pCoco, pPose]);
-
-      if (faceModel || objectModel || poseDetector) {
-          isLoaded = true;
-          postMessage({ type: 'PROGRESS', label: 'SYSTEM_READY', value: 1.0 });
-          postMessage({ type: 'LOADED' });
-      } else {
-          throw new Error("No models loaded successfully");
-      }
-      
-    } catch (e) {
-      console.error("Worker Critical Error:", e);
-      postMessage({ type: 'ERROR', message: e.message });
-      setTimeout(() => { isLoading = false; initModels(); }, 5000);
-    } finally {
-      isLoading = false;
-    }
+      [faceModel, objectModel, poseDetector] = await Promise.all([
+        faceLandmarksDetection.load(faceLandmarksDetection.SupportedPackages.mediapipeFacemesh, { maxFaces: 1 }),
+        cocoSsd.load({ base: 'lite_mobilenet_v2' }),
+        poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING })
+      ]);
+      isLoaded = true;
+      postMessage({ type: 'LOADED' });
+    } catch (e) { postMessage({ type: 'ERROR', message: e.message }); }
   };
-
-  initModels();
+  init();
 
   onmessage = async (e) => {
-    if (!isLoaded || !e.data.imageBitmap) {
-        if (e.data.imageBitmap && typeof e.data.imageBitmap.close === 'function') {
-            e.data.imageBitmap.close();
-        }
-        return;
-    }
-    
-    const { imageBitmap } = e.data;
-    const markers = [];
-    const bmpWidth = imageBitmap.width;
-    const bmpHeight = imageBitmap.height;
-
+    if (!isLoaded || !e.data.imageBitmap) return;
+    const { imageBitmap, orientation } = e.data;
+    const w = imageBitmap.width, h = imageBitmap.height;
     tf.engine().startScope();
-
     try {
       const pixels = tf.browser.fromPixels(imageBitmap);
+      const detections = [];
+      const tasks = [];
 
-      // Execute detections in parallel if possible, or sequentially within engine scope
-      // JS is single threaded but TFJS might optimize backend ops. 
-      // We keep sequential awaiting here to manage scope cleanup easily, 
-      // but logic inside could be Promise.all if independent.
-      
-      const promises = [];
+      if (faceModel) tasks.push(faceModel.estimateFaces({ input: pixels }).then(faces => {
+        faces.forEach(f => {
+          detections.push({ 
+            label: 'БИО_ЛИЦО', shape: 'face_mesh',
+            x: (f.boundingBox.topLeft[0] + (f.boundingBox.bottomRight[0] - f.boundingBox.topLeft[0])/2)/w,
+            y: (f.boundingBox.topLeft[1] + (f.boundingBox.bottomRight[1] - f.boundingBox.topLeft[1])/2)/h,
+            width: (f.boundingBox.bottomRight[0] - f.boundingBox.topLeft[0])/w,
+            height: (f.boundingBox.bottomRight[1] - f.boundingBox.topLeft[1])/h,
+            confidence: 0.95 
+          });
+        });
+      }));
 
-      // 1. Face Mesh
-      if (faceModel) {
-          promises.push(faceModel.estimateFaces({ input: pixels }).then(faces => {
-              if (faces.length > 0) {
-                  const face = faces[0];
-                  const mesh = face.scaledMesh; 
-                  
-                  const xs = mesh.map(p => p[0]);
-                  const ys = mesh.map(p => p[1]);
-                  const minX = Math.min(...xs);
-                  const maxX = Math.max(...xs);
-                  const minY = Math.min(...ys);
-                  const maxY = Math.max(...ys);
-                  
-                  const lipTop = mesh[13];
-                  const lipBot = mesh[14];
-                  const mouthOpen = Math.abs(lipBot[1] - lipTop[1]);
-                  const mouthHeight = maxY - minY;
-                  const isTalking = (mouthOpen / mouthHeight) > 0.05;
-
-                  const contours = {};
-                  for (const [part, indices] of Object.entries(FACE_TOPOLOGY)) {
-                      contours[part] = indices.map(i => ({ 
-                          x: mesh[i][0] / bmpWidth, 
-                          y: mesh[i][1] / bmpHeight 
-                      }));
-                  }
-
-                  markers.push({
-                      id: 'face-mesh-0',
-                      label: isTalking ? 'РЕЧЬ' : 'ЛИЦО',
-                      x: (minX + (maxX - minX) / 2) / bmpWidth,
-                      y: (minY + (maxY - minY) / 2) / bmpHeight,
-                      width: (maxX - minX) / bmpWidth,
-                      height: (maxY - minY) / bmpHeight,
-                      shape: 'face_mesh',
-                      source: 'ai',
-                      confidence: 0.99,
-                      contours: contours,
-                      distance: 0.5 
-                  });
-              }
-          }));
-      }
-
-      // 2. Pose
-      if (poseDetector) {
-        promises.push(poseDetector.estimatePoses(pixels, { flipHorizontal: false, maxPoses: 1 }).then(poses => {
-            poses.forEach((pose, idx) => {
-               if (pose.score > 0.35) { 
-                 const xs = pose.keypoints.map(k => k.x);
-                 const ys = pose.keypoints.map(k => k.y);
-                 const minX = Math.min(...xs);
-                 const maxX = Math.max(...xs);
-                 const minY = Math.min(...ys);
-                 const maxY = Math.max(...ys);
-                 
-                 markers.push({
-                   id: 'pose-' + idx,
-                   label: 'ТЕЛО',
-                   x: (minX + (maxX - minX) / 2) / bmpWidth,
-                   y: (minY + (maxY - minY) / 2) / bmpHeight,
-                   width: (maxX - minX) / bmpWidth,
-                   height: (maxY - minY) / bmpHeight,
-                   shape: 'skeleton',
-                   source: 'local',
-                   confidence: pose.score,
-                   keypoints: pose.keypoints.map(k => ({
-                       ...k,
-                       x: k.x / bmpWidth,
-                       y: k.y / bmpHeight
-                   })),
-                   distance: 0 
-                 });
-               }
-            });
-        }));
-      }
-
-      // 3. Objects
-      if (objectModel) {
-          promises.push(objectModel.detect(pixels, undefined, 0.35).then(predictions => {
-              predictions.forEach((p, idx) => {
-                  if (p.class === 'person') return; 
-                  if (p.bbox[2] * p.bbox[3] < 100) return;
-
-                  markers.push({
-                     id: 'obj-' + p.class + '-' + idx,
-                     label: p.class,
-                     x: (p.bbox[0] + p.bbox[2] / 2) / bmpWidth,
-                     y: (p.bbox[1] + p.bbox[3] / 2) / bmpHeight,
-                     width: p.bbox[2] / bmpWidth,
-                     height: p.bbox[3] / bmpHeight,
-                     shape: 'box',
-                     source: 'local',
-                     confidence: p.score
-                  });
+      if (poseDetector) tasks.push(poseDetector.estimatePoses(pixels).then(poses => {
+        poses.forEach(p => {
+          if (p.score > 0.5) {
+            const xs = p.keypoints.filter(k => k.score > 0.3).map(k => k.x);
+            const ys = p.keypoints.filter(k => k.score > 0.3).map(k => k.y);
+            if (xs.length > 0) {
+              detections.push({ 
+                label: 'ГУМАНОИД', shape: 'skeleton',
+                x: (Math.min(...xs) + (Math.max(...xs)-Math.min(...xs))/2)/w,
+                y: (Math.min(...ys) + (Math.max(...ys)-Math.min(...ys))/2)/h,
+                width: (Math.max(...xs)-Math.min(...xs))/w, height: (Math.max(...ys)-Math.min(...ys))/h,
+                keypoints: p.keypoints.map(k => ({ ...k, x: k.x/w, y: k.y/h })),
+                confidence: p.score 
               });
-          }));
-      }
+            }
+          }
+        });
+      }));
 
-      await Promise.all(promises);
-      postMessage({ type: 'RESULT', markers, timestamp: Date.now() });
-      
-    } catch (err) {
-      console.error("Worker Runtime Error", err);
-    } finally {
-      tf.engine().endScope();
-      if (typeof imageBitmap.close === 'function') imageBitmap.close();
-    }
+      if (objectModel) tasks.push(objectModel.detect(pixels, 8, 0.4).then(preds => {
+        preds.forEach(p => {
+          if (p.class !== 'person') {
+            detections.push({ 
+              label: (TRANSLATIONS[p.class] || p.class).toUpperCase(), shape: 'box',
+              x: (p.bbox[0] + p.bbox[2]/2)/w, y: (p.bbox[1] + p.bbox[3]/2)/h,
+              width: p.bbox[2]/w, height: p.bbox[3]/h, confidence: p.score 
+            });
+          }
+        });
+      }));
+
+      await Promise.all(tasks);
+      postMessage({ type: 'RESULT', detections, orientation });
+    } catch(err) { console.error(err); } finally { tf.engine().endScope(); imageBitmap.close(); }
   };
 `;
+
+interface PersistenceData {
+  id: string;
+  hits: number;
+  misses: number;
+  lastSeen: number;
+  worldX: number;
+  worldY: number;
+  w: number;
+  h: number;
+  label: string;
+  shape: string;
+  distAvg: number[];
+  keypoints?: Keypoint[];
+  velocity: { x: number; y: number };
+}
 
 export class ObjectDetectionService {
   private worker: Worker | null = null;
   private isReady = false;
-  private isBusy = false; 
-  private lastProcessedTime = 0;
+  private isBusy = false;
   private lastMarkers: Marker[] = [];
+  private persistenceCache = new Map<string, PersistenceData>();
+  private nextId = 0;
+  private anchorOri: { a: number; b: number } | null = null;
 
-  private currentVideoWidth = 1;
-  private currentVideoHeight = 1;
-
-  // Real-world height estimates (in meters) for distance calculation
-  private readonly OBJECT_HEIGHTS: Record<string, number> = {
-      // COCO SSD Labels
-      'person': 1.7,
-      'bicycle': 1.0,
-      'car': 1.5,
-      'motorcycle': 1.1,
-      'airplane': 10.0,
-      'bus': 3.2,
-      'train': 4.0,
-      'truck': 3.5,
-      'boat': 2.0,
-      'traffic light': 0.8,
-      'fire hydrant': 0.6,
-      'stop sign': 0.9,
-      'parking meter': 1.2,
-      'bench': 0.5,
-      'bird': 0.2,
-      'cat': 0.3,
-      'dog': 0.6,
-      'horse': 1.6,
-      'sheep': 0.8,
-      'cow': 1.4,
-      'elephant': 3.0,
-      'bear': 1.2,
-      'zebra': 1.4,
-      'giraffe': 5.0,
-      'backpack': 0.5,
-      'umbrella': 0.5,
-      'handbag': 0.3,
-      'tie': 0.5,
-      'suitcase': 0.6,
-      'frisbee': 0.3,
-      'skis': 1.8,
-      'snowboard': 1.5,
-      'sports ball': 0.25,
-      'kite': 0.5,
-      'baseball bat': 0.9,
-      'baseball glove': 0.3,
-      'skateboard': 0.2,
-      'surfboard': 2.0,
-      'tennis racket': 0.7,
-      'bottle': 0.25,
-      'wine glass': 0.2,
-      'cup': 0.15,
-      'fork': 0.2,
-      'knife': 0.2,
-      'spoon': 0.15,
-      'bowl': 0.15,
-      'banana': 0.2,
-      'apple': 0.1,
-      'sandwich': 0.1,
-      'orange': 0.1,
-      'broccoli': 0.15,
-      'carrot': 0.15,
-      'hot dog': 0.15,
-      'pizza': 0.3,
-      'donut': 0.1,
-      'cake': 0.2,
-      'chair': 1.0,
-      'couch': 0.9,
-      'potted plant': 0.5,
-      'bed': 0.6,
-      'dining table': 0.75,
-      'toilet': 0.5,
-      'tv': 0.6,
-      'laptop': 0.3,
-      'mouse': 0.05,
-      'remote': 0.2,
-      'keyboard': 0.03,
-      'cell phone': 0.15,
-      'microwave': 0.35,
-      'oven': 0.8,
-      'toaster': 0.25,
-      'sink': 0.2,
-      'refrigerator': 1.7,
-      'book': 0.25,
-      'clock': 0.3,
-      'vase': 0.4,
-      'scissors': 0.2,
-      'teddy bear': 0.5,
-      'hair drier': 0.25,
-      'toothbrush': 0.18,
-      
-      // Custom Labels from Worker
-      'лицо': 0.25, // Face
-      'речь': 0.25, // Talking face
-      'тело': 1.7   // Pose body
+  private readonly HEIGHTS: Record<string, number> = {
+    'ГУМАНОИД': 1.72, 'АВТО': 1.45, 'ГРУЗОВИК': 3.4, 'ТЕЛЕФОН': 0.16, 'БИО_ЛИЦО': 0.23, 'НОУТБУК': 0.28
   };
   
-  private readonly DEFAULT_HEIGHT = 1.0;
-  
-  public onProgress: (label: string, value: number) => void = () => {};
+  private readonly H_FOV = 60; 
+  private readonly MAX_MISSING_MS = 1500;
+  private readonly DISTANT_THRESHOLD = 10.0;
+  private readonly EXTRAPOLATION_LIMIT = 5;
 
   public load() {
-    if (this.worker) return;
-
-    const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
-    this.worker = new Worker(URL.createObjectURL(blob));
-
+    this.worker = new Worker(URL.createObjectURL(new Blob([WORKER_CODE], { type: 'application/javascript' })));
     this.worker.onmessage = (e) => {
-      if (e.data.type === 'LOADED') {
-        this.isReady = true;
-        console.log("Detection Service Ready");
-      } else if (e.data.type === 'PROGRESS') {
-        this.onProgress(e.data.label, e.data.value);
-      } else if (e.data.type === 'RESULT') {
-        this.lastMarkers = this.processRawMarkers(e.data.markers);
+      if (e.data.type === 'LOADED') this.isReady = true;
+      if (e.data.type === 'RESULT') { 
+        this.lastMarkers = this.process(e.data.detections, e.data.orientation); 
         this.isBusy = false; 
-      } else if (e.data.type === 'ERROR') {
-        console.error("Worker reported error:", e.data.message);
-        this.isBusy = false;
       }
     };
-    
-    // Safety watchdog
-    setInterval(() => { this.isBusy = false; }, 4000);
   }
 
-  public dispose() {
-    if (this.worker) {
-        this.worker.terminate();
-        this.worker = null;
-    }
-    this.isReady = false;
-  }
-
-  public async detect(video: HTMLVideoElement): Promise<Marker[]> {
-    if (!this.worker) return this.lastMarkers;
-
-    const now = Date.now();
-    // Throttle reduced to 10ms (virtually uncapped, limited by processing speed)
-    if (now - this.lastProcessedTime < 10) return this.lastMarkers;
-
-    if (!this.isBusy) {
-        try {
-            this.isBusy = true;
-            this.lastProcessedTime = now;
-            this.currentVideoWidth = video.videoWidth;
-            this.currentVideoHeight = video.videoHeight;
-            
-            const imageBitmap = await createImageBitmap(video, { 
-                resizeWidth: 640, 
-                resizeQuality: 'medium' 
-            });
-
-            this.worker.postMessage({ 
-                imageBitmap, 
-                originalWidth: this.currentVideoWidth,
-                originalHeight: this.currentVideoHeight
-            }, [imageBitmap]); 
-        } catch (e) {
-            this.isBusy = false;
-        }
-    }
-
+  public async detect(video: HTMLVideoElement, ori: { a: number; b: number }): Promise<Marker[]> {
+    if (!this.isReady || this.isBusy) return this.lastMarkers;
+    this.isBusy = true;
+    try {
+        const bmp = await createImageBitmap(video, { resizeWidth: 320, resizeQuality: 'low' }); 
+        this.worker?.postMessage({ imageBitmap: bmp, orientation: { ...ori } }, [bmp]);
+    } catch(e) { this.isBusy = false; }
     return this.lastMarkers;
   }
 
-  private processRawMarkers(normalizedMarkers: Marker[]): Marker[] {
-    return normalizedMarkers.map(m => {
-        const denormHeight = (m.height || 0) * this.currentVideoHeight;
+  private getAlphaDiff(a1: number, a2: number) {
+    let diff = a1 - a2;
+    while (diff > 180) diff -= 360;
+    while (diff < -180) diff += 360;
+    return diff;
+  }
+
+  private process(newDets: any[], captureOri: { a: number; b: number }): Marker[] {
+    const now = Date.now();
+    if (!this.anchorOri) this.anchorOri = { ...captureOri };
+
+    const da = this.getAlphaDiff(captureOri.a, this.anchorOri.a);
+    const db = captureOri.b - this.anchorOri.b;
+
+    const worldOffsetX = da / this.H_FOV; 
+    const worldOffsetY = db / (this.H_FOV * 0.5625); // 9/16 aspect ratio
+
+    const currentWorldDets = newDets.map(d => ({
+        ...d,
+        wx: d.x + worldOffsetX,
+        wy: d.y + worldOffsetY,
+        keypoints: d.keypoints ? d.keypoints.map((k:any) => ({ 
+            ...k, 
+            x: k.x + worldOffsetX, 
+            y: k.y + worldOffsetY 
+        })) : null
+    }));
+
+    const matchedIdx = new Set<number>();
+    
+    for (const [id, data] of this.persistenceCache.entries()) {
+      let bestMatchIdx = -1;
+      let maxIoU = 0.05;
+
+      const dt_sec = (now - data.lastSeen) / 1000;
+      const predX = data.worldX + (data.velocity.x * dt_sec);
+      const predY = data.worldY + (data.velocity.y * dt_sec);
+
+      currentWorldDets.forEach((det, idx) => {
+        if (matchedIdx.has(idx)) return;
+        const iou = this.getIoU({ worldX: predX, worldY: predY, w: data.w, h: data.h }, 
+                                { wx: det.wx, wy: det.wy, w: det.width, h: det.height });
+        if (iou > maxIoU) { 
+            maxIoU = iou; 
+            bestMatchIdx = idx; 
+        }
+      });
+
+      if (bestMatchIdx !== -1) {
+        const det = currentWorldDets[bestMatchIdx];
+        matchedIdx.add(bestMatchIdx);
         
-        return {
-            ...m,
-            label: this.translateLabel(m.label),
-            x: m.x * this.currentVideoWidth,
-            y: m.y * this.currentVideoHeight,
-            width: (m.width || 0) * this.currentVideoWidth,
-            height: denormHeight,
-            keypoints: m.keypoints?.map(k => ({
-                ...k,
-                x: k.x * this.currentVideoWidth,
-                y: k.y * this.currentVideoHeight
-            })),
-            contours: m.contours ? this.processContours(m.contours) : undefined,
-            distance: this.calculateDistance(m.label, denormHeight) // Use original label for lookup
-        };
-    });
-  }
+        const dt = (now - data.lastSeen) / 1000;
+        if (dt > 0.01) {
+            const instVX = (det.wx - data.worldX) / dt;
+            const instVY = (det.wy - data.worldY) / dt;
+            data.velocity.x = data.velocity.x * 0.7 + instVX * 0.3;
+            data.velocity.y = data.velocity.y * 0.7 + instVY * 0.3;
+        }
 
-  private processContours(rawContours: any): any {
-      const processed: any = {};
-      for(const [key, points] of Object.entries(rawContours)) {
-          processed[key] = (points as any[]).map(p => ({
-              x: p.x * this.currentVideoWidth,
-              y: p.y * this.currentVideoHeight
-          }));
+        data.worldX = det.wx;
+        data.worldY = det.wy;
+        data.w = det.width;
+        data.h = det.height;
+        data.keypoints = det.keypoints;
+        data.lastSeen = now;
+        data.hits++;
+        data.misses = 0;
+        
+        const realH = this.HEIGHTS[det.label] || 1.2;
+        data.distAvg.push(realH / (data.h * 1.15));
+        if (data.distAvg.length > 5) data.distAvg.shift();
+      } else {
+        const dt_miss = (now - data.lastSeen) / 1000;
+        if (dt_miss < 1.0 && data.hits > 3 && data.misses < this.EXTRAPOLATION_LIMIT) {
+            data.misses++;
+            data.worldX += data.velocity.x * dt_miss;
+            data.worldY += data.velocity.y * dt_miss;
+            data.lastSeen = now; 
+        }
       }
-      return processed;
+    }
+
+    currentWorldDets.forEach((det, idx) => {
+      if (matchedIdx.has(idx) || det.confidence < 0.4) return;
+      const id = 'local-' + this.nextId++;
+      this.persistenceCache.set(id, {
+        id, hits: 1, misses: 0, lastSeen: now,
+        worldX: det.wx, worldY: det.wy,
+        w: det.width, h: det.height,
+        label: det.label, shape: det.shape,
+        keypoints: det.keypoints,
+        distAvg: [ (this.HEIGHTS[det.label] || 1.2) / (det.height * 1.15) ],
+        velocity: { x: 0, y: 0 }
+      });
+    });
+
+    const markers: Marker[] = [];
+    for (const [id, data] of this.persistenceCache.entries()) {
+      const staleTime = (now - data.lastSeen);
+      if (staleTime > this.MAX_MISSING_MS) {
+        this.persistenceCache.delete(id); 
+        continue;
+      }
+      const avgDist = data.distAvg.reduce((a, b) => a + b, 0) / data.distAvg.length;
+      markers.push({
+        id: data.id, label: data.label,
+        x: data.worldX, y: data.worldY, width: data.w, height: data.h,
+        shape: data.shape as any,
+        keypoints: data.keypoints,
+        distance: parseFloat(avgDist.toFixed(1)),
+        lastUpdated: data.lastSeen,
+        source: 'local',
+        confidence: data.misses > 0 ? 0.4 : 0.9,
+        speed: parseFloat((Math.sqrt(data.velocity.x**2 + data.velocity.y**2) * 60).toFixed(1))
+      });
+    }
+    return markers;
   }
 
-  private calculateDistance(label: string, bboxHeightPixels: number): number {
-      if (bboxHeightPixels <= 0) return 0;
-      
-      const realHeight = this.OBJECT_HEIGHTS[label.toLowerCase()] || this.DEFAULT_HEIGHT;
-      
-      // Estimated Focal Length in pixels
-      // Assuming a vertical Field of View (FOV) of approx 45 degrees for standard webcams/phones.
-      // f_pixel = (ImageHeight / 2) / tan(FOV_vertical / 2)
-      // tan(22.5) ~ 0.414
-      // f_pixel = (H / 2) / 0.414 = H * 1.2
-      const fPixels = this.currentVideoHeight * 1.2; 
-      
-      // Distance = (RealHeight * FocalLength) / ObjectHeight_pixels
-      const distance = (realHeight * fPixels) / bboxHeightPixels;
-      
-      return parseFloat(distance.toFixed(1));
+  private getIoU(a: {worldX: number, worldY: number, w: number, h: number}, 
+                 b: {wx: number, wy: number, w: number, h: number}) {
+    const x1 = Math.max(a.worldX - a.w/2, b.wx - b.w/2);
+    const y1 = Math.max(a.worldY - a.h/2, b.wy - b.h/2);
+    const x2 = Math.min(a.worldX + a.w/2, b.wx + b.w/2);
+    const y2 = Math.min(a.worldY + a.h/2, b.wy + b.h/2);
+    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    const union = (a.w * a.h) + (b.w * b.h) - inter;
+    return inter / (union || 0.0001);
   }
 
-  private translateLabel(englishLabel: string): string {
-       const map: Record<string, string> = {
-          'person': 'ЧЕЛОВЕК',
-          'bicycle': 'ВЕЛО',
-          'car': 'АВТО',
-          'motorcycle': 'МОТО',
-          'airplane': 'БПЛА',
-          'bus': 'АВТОБУС',
-          'train': 'ПОЕЗД',
-          'truck': 'ГРУЗ',
-          'boat': 'ЛОДКА',
-          'traffic light': 'СВЕТОФОР',
-          'stop sign': 'СТОП',
-          'cat': 'КОТ',
-          'dog': 'СОБАКА',
-          'backpack': 'РЮКЗАК',
-          'umbrella': 'ЗОНТ',
-          'handbag': 'СУМКА',
-          'suitcase': 'КЕЙС',
-          'bottle': 'БУТЫЛКА',
-          'knife': 'НОЖ',
-          'laptop': 'ТЕРМИНАЛ',
-          'cell phone': 'СМАРТФОН',
-          'book': 'ДОКУМЕНТЫ',
-      };
-      return map[englishLabel] || englishLabel.toUpperCase();
-  }
+  public dispose() { this.worker?.terminate(); }
 }

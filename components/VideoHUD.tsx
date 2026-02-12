@@ -1,712 +1,358 @@
-import React, { useEffect, useRef, useState } from 'react';
+
 import { Marker } from '../types';
 import { ObjectDetectionService } from '../services/objectDetectionService';
+import React, { useEffect, useRef, useCallback } from 'react';
 
 interface VideoHUDProps {
-  markers: Marker[]; 
+  markers: Marker[];
   onVideoFrame: (base64: string) => void;
+  onAddManualMarker?: (x: number, y: number) => void;
   localStream: MediaStream | null;
-  zoomLevel?: number; 
-  activeFilter?: string; 
-  visualMode?: string; 
+  zoomLevel?: number;
+  visualMode?: string;
+  xrMode?: boolean;
 }
 
-// --- RENDER WORKER (Runs in a separate thread for 60FPS UI) ---
 const RENDER_WORKER_CODE = `
-  let ctx = null;
-  let canvasWidth = 0;
-  let canvasHeight = 0;
-  
-  // State
-  let markers = [];
-  let visualState = new Map(); 
-  
-  // IMU Stabilization State
-  let currentOrientation = { alpha: 0, beta: 0, gamma: 0 };
-  let anchorOrientation = { alpha: 0, beta: 0, gamma: 0 }; 
-  let orientationInitialized = false;
+  let ctx = null, canvasW = 0, canvasH = 0, markers = [], state = new Map();
+  let currentOri = { a: 0, b: 0 }, anchorOri = { a: 0, b: 0 }, oriInit = false;
+  let zoom = 1, mode = 'normal', xr = false, lastTime = performance.now();
 
-  let zoomLevel = 1;
-  let lastTime = 0;
-  let visualMode = 'normal';
-  let tick = 0;
-  
-  // Constants
-  const COLOR_PRIMARY = '#ffaa00';
-  const COLOR_DANGER = '#ff3300';
-  const COLOR_MACHINE = '#00ff41'; 
-  const COLOR_FACE = '#00ffff'; 
+  const f = 12.0; 
+  const z = 0.55;  
+  const r = 2.2;  
 
-  const SKELETON_CONNECTIONS = [
-      [0, 1], [0, 2], [1, 3], [2, 4], 
-      [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], 
-      [5, 11], [6, 12], [11, 12], 
-      [11, 13], [13, 15], [12, 14], [14, 16]
+  const k1 = z / (Math.PI * f);
+  const k2 = 1 / ((2 * Math.PI * f) * (2 * Math.PI * f));
+  const k3 = r * z / (2 * Math.PI * f);
+  const H_FOV = 60;
+
+  const POSE_CONNECTIONS = [
+    [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], 
+    [11, 12], [5, 11], [6, 12], 
+    [11, 13], [13, 15], [12, 14], [14, 16]
   ];
-  
-  const KEYPOINT_NAMES = {
-      0: 'HEAD',
-      9: 'R_HAND',
-      10: 'L_HAND', 
-      15: 'R_FOOT',
-      16: 'L_FOOT'
-  };
 
-  // PHYSICS CONFIG FOR SMOOTH TRACKING
-  // Stiffness: How fast it pulls towards target (Higher = snappier, Lower = loose)
-  // Damping: Friction (Lower = bouncy, Higher = sludge)
-  const SPRING = { stiffness: 0.25, damping: 0.75 };
-  const PERSISTENCE_MS = 500; 
-
-  // Helper: Apply spring force to a value
-  function updateSpring(current, target, velocity) {
-      const delta = target - current;
-      const force = delta * SPRING.stiffness;
-      velocity += force;
-      velocity *= SPRING.damping;
-      return { val: current + velocity, vel: velocity };
+  function updateSecondOrder(v, target, dt) {
+    const T = Math.min(dt / 1000, 0.016);
+    const x = v.current;
+    const x_dot = v.vel;
+    const x_target = target;
+    const x_target_dot = (x_target - v.lastTarget) / (T || 0.001);
+    v.lastTarget = x_target;
+    
+    const iterations = 3; 
+    const h = T / iterations;
+    for(let i=0; i<iterations; i++) {
+        const acceleration = (x_target + k3 * x_target_dot - x - k1 * x_dot) / k2;
+        v.vel = v.vel + h * acceleration;
+        v.current = v.current + h * v.vel;
+    }
+    return v.current;
   }
 
-  // Helper: Linear Interpolation for simple opacity
-  const lerp = (start, end, factor) => start + (end - start) * factor;
+  function getAlphaDiff(a1, a2) {
+    let diff = a1 - a2;
+    while (diff > 180) diff -= 360;
+    while (diff < -180) diff += 360;
+    return diff;
+  }
+
+  function getMarkerColor(id, d, baseAccent) {
+      if (id.startsWith('manual')) return '#ff3333';
+      const hash = id.split('').reduce((acc, char) => char.charCodeAt(0) + ((acc << 5) - acc), 0);
+      const hue = Math.abs(hash % 360);
+      return mode === 'thermal' ? '#ffffff' : (mode === 'machine' ? "hsl(" + hue + ", 100%, 50%)" : (d < 5 ? '#ff0000' : baseAccent));
+  }
 
   self.onmessage = (e) => {
     const { type, payload } = e.data;
-
     if (type === 'INIT') {
-      const canvas = payload.canvas;
-      ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
-      canvasWidth = canvas.width;
-      canvasHeight = canvas.height;
+      ctx = payload.canvas.getContext('2d', { alpha: true, desynchronized: true });
+      canvasW = payload.canvas.width; canvasH = payload.canvas.height;
       requestAnimationFrame(loop);
-    }
-    else if (type === 'RESIZE') {
-      canvasWidth = payload.width;
-      canvasHeight = payload.height;
-      if (ctx) {
-         ctx.canvas.width = payload.width;
-         ctx.canvas.height = payload.height;
-      }
-    }
-    else if (type === 'UPDATE_MARKERS') {
+    } else if (type === 'UPDATE_MARKERS') {
       markers = payload;
-      // Resync anchor slightly to drift towards truth, but keep smooth
-      if (orientationInitialized) {
-          // Soft anchor reset could be implemented here if drift is high
+    } else if (type === 'UPDATE_SENSORS') {
+      if (!oriInit && payload.ori.alpha !== null) { 
+        anchorOri = { a: payload.ori.alpha, b: payload.ori.beta }; 
+        oriInit = true; 
       }
-    }
-    else if (type === 'UPDATE_SENSORS') {
-      const a = 0.2; // Faster smoothing for sensors
-      if (!orientationInitialized) {
-         currentOrientation = payload.orientation;
-         anchorOrientation = payload.orientation;
-         orientationInitialized = true;
-      } else {
-         const raw = payload.orientation;
-         
-         // Handle Alpha Wrap
-         let dAlpha = raw.alpha - currentOrientation.alpha;
-         if (dAlpha > 180) dAlpha -= 360;
-         if (dAlpha < -180) dAlpha += 360;
-         
-         currentOrientation.alpha += dAlpha * a;
-         // Normalize alpha
-         if (currentOrientation.alpha < 0) currentOrientation.alpha += 360;
-         if (currentOrientation.alpha >= 360) currentOrientation.alpha -= 360;
-
-         currentOrientation.beta = lerp(currentOrientation.beta, raw.beta, a);
-         currentOrientation.gamma = lerp(currentOrientation.gamma, raw.gamma, a);
-      }
-      zoomLevel = payload.zoom;
-    }
-    else if (type === 'UPDATE_MODE') {
-      visualMode = payload;
+      currentOri = { a: payload.ori.alpha, b: payload.ori.beta };
+      zoom = payload.zoom;
+    } else if (type === 'UPDATE_MODE') { 
+        mode = payload.mode; 
+        xr = payload.xr;
     }
   };
 
-  function drawGrid(ctx, w, h, roll, pitchOffset) {
-      ctx.save();
-      ctx.translate(w/2, h/2);
-      ctx.rotate(roll);
-      ctx.translate(0, pitchOffset);
-      
-      const speed = (Date.now() / 50) % 50;
-      ctx.strokeStyle = 'rgba(0, 255, 65, 0.15)';
-      ctx.lineWidth = 1;
-      
-      ctx.beginPath();
-      // Longitudinal
-      for(let i=-20; i<=20; i++) {
-          const x = i * 40 * zoomLevel;
-          ctx.moveTo(x, -h * 2); 
-          ctx.lineTo(x * 3, h * 2); 
-      }
-      // Latitudinal
-      for(let i=0; i<20; i++) {
-          const y = (Math.pow(i, 1.8) * 5 * zoomLevel) + speed;
-          if (y > h) continue;
-          ctx.moveTo(-w * 2, y);
-          ctx.lineTo(w * 2, y);
-      }
-      ctx.stroke();
-      ctx.restore();
-  }
-  
-  function drawPath(ctx, points, shiftX, shiftY, close = false, fill = false) {
-      if (!points || points.length === 0) return;
-      ctx.beginPath();
-      ctx.moveTo(points[0].x + shiftX, points[0].y + shiftY);
-      for(let i=1; i<points.length; i++) {
-          ctx.lineTo(points[i].x + shiftX, points[i].y + shiftY);
-      }
-      if (close) ctx.closePath();
-      if (fill) ctx.fill();
-      ctx.stroke();
-  }
+  function renderView(viewX, viewY, viewW, viewH, ipdOffset) {
+    const da = getAlphaDiff(currentOri.a, anchorOri.a);
+    const db = currentOri.b - anchorOri.b;
+    const currentFOV = H_FOV / zoom;
+    const viewOffsetX = da / currentFOV;
+    const viewOffsetY = db / (currentFOV * (viewH/viewW));
 
-  function loop(timestamp) {
-    if (!ctx) {
-        requestAnimationFrame(loop);
-        return;
-    }
-    
-    tick++;
-    const dt = timestamp - lastTime;
-    lastTime = timestamp;
-    const now = Date.now();
+    const colors = { machine: '#00ff41', thermal: '#ffffff', normal: '#ffaa00' };
+    const baseAccent = colors[mode] || colors.normal;
 
-    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-    
-    const cx = canvasWidth / 2;
-    const cy = canvasHeight / 2;
-    
-    const degPerPixelX = 60 / canvasWidth; 
-    const degPerPixelY = 45 / canvasHeight; 
-    const ppdY = 1 / degPerPixelY;
-    const ppdX = 1 / degPerPixelX;
-
-    const rollRad = (currentOrientation.gamma * Math.PI) / 180;
-    const pitchOffset = currentOrientation.beta * ppdY * zoomLevel;
-
-    const isWireframe = visualMode === 'wireframe';
-    const isMachine = visualMode === 'machine';
-    
-    const mainColor = isWireframe ? '#ffffff' : (isMachine ? COLOR_MACHINE : COLOR_PRIMARY);
-    const dangerColor = isWireframe ? '#ff0000' : COLOR_DANGER;
-
-    // --- IMU Compensation Shift ---
-    // This allows the HUD to stick to the world even if AI is lagging
-    let shiftX = 0;
-    let shiftY = 0;
-
-    if (orientationInitialized) {
-        let dAlpha = currentOrientation.alpha - anchorOrientation.alpha;
-        if (dAlpha > 180) dAlpha -= 360;
-        if (dAlpha < -180) dAlpha += 360;
-        const dBeta = currentOrientation.beta - anchorOrientation.beta;
-        shiftX = -(dAlpha * ppdX);
-        shiftY = -(dBeta * ppdY);
-    }
-    
-    // Background Grid
-    if (isMachine || isWireframe) {
-        drawGrid(ctx, canvasWidth, canvasHeight, rollRad, pitchOffset);
-    }
-
-    // Horizon Line
     ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate(rollRad);
-    ctx.translate(0, pitchOffset);
-    ctx.strokeStyle = isMachine || isWireframe ? 'rgba(0, 255, 65, 0.3)' : 'rgba(255, 170, 0, 0.2)';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(-cx * 4, 0); ctx.lineTo(cx * 4, 0); ctx.stroke();
-    
-    for (let i = -2; i <= 2; i++) {
-        if (i === 0) continue;
-        const y = i * 15 * ppdY * zoomLevel;
-        const w = 50;
-        ctx.beginPath(); ctx.moveTo(-w, y); ctx.lineTo(w, y); ctx.stroke();
-        ctx.fillStyle = ctx.strokeStyle;
-        ctx.font = '10px monospace';
-        ctx.fillText(i * 15 + '°', w + 5, y + 3);
-    }
-    ctx.restore();
+    ctx.beginPath(); ctx.rect(viewX, viewY, viewW, viewH); ctx.clip();
+    ctx.translate(viewX + ipdOffset, viewY);
 
-    // --- UPDATE & DRAW MARKERS ---
+    state.forEach(v => {
+      v.op += (v.active ? 0.3 : -v.op) * 0.15;
+      if (v.op < 0.01) return;
+
+      const cx = (v.x.current - viewOffsetX) * viewW;
+      const cy = (v.y.current - viewOffsetY) * viewH;
+      const d = v.dist.current;
+      const dScale = 1 / (1 + d * 0.08);
+      const hw = (v.w.current * viewW)/2, hh = (v.h.current * viewH)/2;
+
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, v.op);
+      
+      const markerAccent = v.color || getMarkerColor(v.id, d, baseAccent);
+
+      // GROUND PIN
+      if (mode !== 'thermal') {
+          ctx.beginPath();
+          ctx.strokeStyle = markerAccent;
+          ctx.globalAlpha = 0.4 * v.op;
+          ctx.lineWidth = 1;
+          ctx.moveTo(cx, cy + hh);
+          ctx.lineTo(cx, cy + hh + 30 * dScale);
+          ctx.stroke();
+          ctx.globalAlpha = v.op;
+      }
+
+      // BIO JITTER
+      let jitX = 0, jitY = 0;
+      if (v.label.includes('ГУМ') || v.label.includes('БИО')) {
+          jitX = Math.sin(performance.now() * 0.01) * 0.8;
+          jitY = Math.cos(performance.now() * 0.012) * 0.8;
+      }
+
+      // SKELETON
+      if (v.keypoints && v.keypoints.length > 0) {
+          ctx.strokeStyle = mode === 'thermal' ? '#00ffff' : markerAccent;
+          ctx.lineWidth = 2.5 * dScale;
+          ctx.lineCap = 'round';
+          
+          POSE_CONNECTIONS.forEach(([i1, i2]) => {
+              const k1 = v.keypoints[i1]; const k2 = v.keypoints[i2];
+              if (k1 && k2 && k1.score > 0.3 && k2.score > 0.3) {
+                  const x1 = (k1.x - viewOffsetX) * viewW; const y1 = (k1.y - viewOffsetY) * viewH;
+                  const x2 = (k2.x - viewOffsetX) * viewW; const y2 = (k2.y - viewOffsetY) * viewH;
+                  ctx.beginPath(); ctx.moveTo(x1 + jitX, y1 + jitY); ctx.lineTo(x2 + jitX, y2 + jitY); ctx.stroke();
+              }
+          });
+      }
+
+      ctx.translate(cx + jitX, cy + jitY);
+
+      if (v.source === 'manual') {
+          ctx.strokeStyle = markerAccent; ctx.lineWidth = 2.5;
+          ctx.beginPath(); ctx.arc(0, 0, 10, 0, 6.28); ctx.stroke();
+          ctx.fillStyle = markerAccent; ctx.font = 'bold 10px monospace';
+          ctx.fillText(v.label || 'ЦЕЛЬ', 14, 4);
+      } else {
+          ctx.strokeStyle = markerAccent;
+          ctx.lineWidth = 2 * dScale;
+          const cl = 12 * dScale;
+          
+          ctx.beginPath();
+          ctx.moveTo(-hw, -hh+cl); ctx.lineTo(-hw, -hh); ctx.lineTo(-hw+cl, -hh);
+          ctx.moveTo(hw-cl, -hh); ctx.lineTo(hw, -hh); ctx.lineTo(hw, -hh+cl);
+          ctx.moveTo(hw, hh-cl); ctx.lineTo(hw, hh); ctx.lineTo(hw-cl, hh);
+          ctx.moveTo(-hw+cl, hh); ctx.lineTo(-hw, hh); ctx.lineTo(-hw, hh-cl);
+          ctx.stroke();
+
+          ctx.font = 'bold ' + Math.max(10, 14 * dScale) + 'px monospace';
+          ctx.fillStyle = markerAccent;
+          ctx.fillText(v.label, -hw, -hh - 12);
+          
+          if (v.activity) {
+              const actText = v.activity.toUpperCase();
+              ctx.font = 'bold 9px monospace';
+              const tw = ctx.measureText(actText).width;
+              ctx.fillStyle = markerAccent;
+              ctx.globalAlpha = 0.85;
+              ctx.fillRect(hw + 8, -hh, tw + 12, 16);
+              ctx.fillStyle = '#000';
+              ctx.fillText(actText, hw + 14, -hh + 11);
+              ctx.globalAlpha = v.op;
+          }
+
+          ctx.fillStyle = mode === 'thermal' ? '#ff00ff' : '#00ffff'; 
+          ctx.font = '9px monospace';
+          const tel = "[" + d.toFixed(1) + "M] " + (v.speed > 1 ? v.speed + "KM/H" : "");
+          ctx.fillText(tel, -hw, hh + 16);
+      }
+      ctx.restore();
+    });
+    ctx.restore();
+  }
+
+  function loop() {
+    if (!ctx) return requestAnimationFrame(loop);
+    const now = performance.now();
+    const dt = Math.min(now - lastTime, 32); 
+    lastTime = now;
+    ctx.clearRect(0, 0, canvasW, canvasH);
     const activeIds = new Set();
     
     markers.forEach(m => {
-        activeIds.add(m.id);
-        let visual = visualState.get(m.id);
-        
-        if (!visual) {
-            // New Marker Initialization
-            visual = { 
-                ...m, 
-                currentOpacity: 0, 
-                targetOpacity: 1, 
-                lastSeen: now,
-                // Physics State
-                vx: 0, vy: 0, vw: 0, vh: 0,
-                // Deep structure for complex shapes
-                keypointsState: m.keypoints ? m.keypoints.map(k => ({ x: k.x, y: k.y, vx: 0, vy: 0 })) : [],
-                contoursState: m.contours ? JSON.parse(JSON.stringify(m.contours)) : null
-            };
-            // Init contour velocities
-            if (visual.contoursState) {
-                for (let key in visual.contoursState) {
-                    visual.contoursState[key] = visual.contoursState[key].map(p => ({ x: p.x, y: p.y, vx: 0, vy: 0 }));
-                }
-            }
-            visualState.set(m.id, visual);
-        } else {
-            // Update Target
-            visual.targetOpacity = 1;
-            visual.lastSeen = now;
-            // We only update the 'target' properties on the visual object
-            // The physics loop below handles the actual movement
-            visual.targetX = m.x;
-            visual.targetY = m.y;
-            visual.targetW = m.width || 0;
-            visual.targetH = m.height || 0;
-            visual.targetKeypoints = m.keypoints;
-            visual.targetContours = m.contours;
-            visual.label = m.label; // Instant update for text
-            visual.distance = m.distance;
-        }
+      activeIds.add(m.id);
+      let v = state.get(m.id);
+      if (!v) {
+        v = { 
+            id: m.id, op: 0, 
+            x: { current: m.x, vel: 0, lastTarget: m.x },
+            y: { current: m.y, vel: 0, lastTarget: m.y },
+            w: { current: m.width || 0.1, vel: 0, lastTarget: m.width || 0.1 },
+            h: { current: m.height || 0.1, vel: 0, lastTarget: m.height || 0.1 },
+            dist: { current: m.distance || 0, vel: 0, lastTarget: m.distance || 0 }
+        };
+        state.set(m.id, v);
+      }
+      v.targetX = m.x; v.targetY = m.y; v.targetW = m.width || 0.1; v.targetH = m.height || 0.1;
+      v.targetDist = m.distance || 0;
+      v.label = m.label; v.source = m.source; v.speed = m.speed || 0;
+      v.activity = m.activity; v.color = m.color; v.keypoints = m.keypoints; v.active = true;
     });
 
-    visualState.forEach((m, id) => {
-        if (!activeIds.has(id)) {
-            if (now - m.lastSeen < PERSISTENCE_MS) { m.targetOpacity = 1; } 
-            else { m.targetOpacity = 0; }
-        }
-        m.currentOpacity = lerp(m.currentOpacity, m.targetOpacity, 0.15);
-        if (m.currentOpacity < 0.05) { visualState.delete(id); return; }
-
-        // --- PHYSICS UPDATE ---
-        const boxX = updateSpring(m.x, m.targetX !== undefined ? m.targetX : m.x, m.vx);
-        m.x = boxX.val; m.vx = boxX.vel;
-        
-        const boxY = updateSpring(m.y, m.targetY !== undefined ? m.targetY : m.y, m.vy);
-        m.y = boxY.val; m.vy = boxY.vel;
-        
-        const boxW = updateSpring(m.width, m.targetW !== undefined ? m.targetW : m.width, m.vw);
-        m.width = boxW.val; m.vw = boxW.vel;
-
-        const boxH = updateSpring(m.height, m.targetH !== undefined ? m.targetH : m.height, m.vh);
-        m.height = boxH.val; m.vh = boxH.vel;
-
-        // --- DRAWING ---
-        ctx.globalAlpha = m.currentOpacity;
-        
-        // Final position with stabilization
-        const x = m.x + shiftX; 
-        const y = m.y + shiftY; 
-        
-        // Culling
-        if (x < -200 || x > canvasWidth + 200 || y < -200 || y > canvasHeight + 200) return;
-
-        const w = m.width; 
-        const h = m.height;
-        const depthScale = Math.max(0.6, Math.min(2.5, 4 / (m.distance || 3)));
-        
-        const baseColor = m.label === 'УГРОЗА' ? dangerColor : mainColor;
-        
-        // Perspective Box
-        const perspective = 0.85; 
-        const vx = x - cx; const vy = y - cy;
-        const bx = cx + vx * perspective; const by = cy + vy * perspective; 
-        const bw = w * perspective; const bh = h * perspective; 
-        
-        const fl = x - w/2, fr = x + w/2; const ft = y - h/2, fb = y + h/2;
-        const bl = bx - bw/2, br = bx + bw/2; const bt = by - bh/2, bb = by + bh/2;
-
-        if (m.shape === 'face_mesh' && m.contoursState && m.targetContours) {
-             const meshColor = isWireframe ? '#00ffff' : (isMachine ? '#00ffaa' : COLOR_FACE);
-             
-             // Update Mesh Physics
-             const renderedContours = {};
-             for (const key in m.contoursState) {
-                 const points = m.contoursState[key];
-                 const targets = m.targetContours[key];
-                 if (targets && points.length === targets.length) {
-                     renderedContours[key] = points.map((p, idx) => {
-                         const px = updateSpring(p.x, targets[idx].x, p.vx);
-                         const py = updateSpring(p.y, targets[idx].y, p.vy);
-                         p.x = px.val; p.vx = px.vel;
-                         p.y = py.val; p.vy = py.vel;
-                         return { x: p.x, y: p.y };
-                     });
-                 } else {
-                     renderedContours[key] = points;
-                 }
-             }
-
-             // Render Mesh
-             ctx.strokeStyle = meshColor;
-             ctx.lineWidth = (isWireframe ? 1.5 : 1) * depthScale;
-             
-             if (renderedContours.silhouette) drawPath(ctx, renderedContours.silhouette, shiftX, shiftY, true);
-
-             // Features
-             ctx.fillStyle = isWireframe ? 'rgba(0, 255, 255, 0.1)' : 'rgba(0, 255, 255, 0.05)';
-             ctx.lineWidth = (isWireframe ? 2 : 1.5) * depthScale;
-             
-             if (renderedContours.lipsUpper && renderedContours.lipsLower) {
-                 drawPath(ctx, renderedContours.lipsUpper, shiftX, shiftY, true, true);
-                 drawPath(ctx, renderedContours.lipsLower, shiftX, shiftY, true, true);
-             }
-
-             if (renderedContours.rightEye) drawPath(ctx, renderedContours.rightEye, shiftX, shiftY, true, true);
-             if (renderedContours.leftEye) drawPath(ctx, renderedContours.leftEye, shiftX, shiftY, true, true);
-
-             ctx.fillStyle = 'transparent';
-             if (renderedContours.rightEyebrow) drawPath(ctx, renderedContours.rightEyebrow, shiftX, shiftY, false);
-             if (renderedContours.leftEyebrow) drawPath(ctx, renderedContours.leftEyebrow, shiftX, shiftY, false);
-             if (renderedContours.nose) drawPath(ctx, renderedContours.nose, shiftX, shiftY, false);
-
-             // Frame Corners for Face
-             const cornerSize = w * 0.2;
-             ctx.strokeStyle = meshColor;
-             ctx.lineWidth = 2 * depthScale;
-             ctx.beginPath(); ctx.moveTo(fl, ft + cornerSize); ctx.lineTo(fl, ft); ctx.lineTo(fl + cornerSize, ft); ctx.stroke();
-             ctx.beginPath(); ctx.moveTo(fr, ft + cornerSize); ctx.lineTo(fr, ft); ctx.lineTo(fr - cornerSize, ft); ctx.stroke();
-             ctx.beginPath(); ctx.moveTo(fl, fb - cornerSize); ctx.lineTo(fl, fb); ctx.lineTo(fl + cornerSize, fb); ctx.stroke();
-             ctx.beginPath(); ctx.moveTo(fr, fb - cornerSize); ctx.lineTo(fr, fb); ctx.lineTo(fr - cornerSize, fb); ctx.stroke();
-
-        } else if (m.shape === 'skeleton' && m.keypointsState && m.targetKeypoints) {
-             // Update Skeleton Physics
-             const renderedKeypoints = m.keypointsState.map((k, idx) => {
-                 const target = m.targetKeypoints[idx];
-                 if (target) {
-                     const kx = updateSpring(k.x, target.x, k.vx);
-                     const ky = updateSpring(k.y, target.y, k.vy);
-                     k.x = kx.val; k.vx = kx.vel;
-                     k.y = ky.val; k.vy = ky.vel;
-                     return { x: k.x, y: k.y, score: target.score };
-                 }
-                 return k;
-             });
-
-             ctx.strokeStyle = baseColor;
-             ctx.lineWidth = (isWireframe ? 4 : 3) * depthScale;
-             ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-
-             ctx.beginPath();
-             for (const [i, j] of SKELETON_CONNECTIONS) {
-                const p1 = renderedKeypoints[i]; const p2 = renderedKeypoints[j];
-                // Check scores from original target to avoid ghosting low conf points
-                if (p1 && p2 && p1.score > 0.6 && p2.score > 0.6) {
-                    ctx.moveTo(p1.x + shiftX, p1.y + shiftY); ctx.lineTo(p2.x + shiftX, p2.y + shiftY);
-                }
-             }
-             ctx.stroke();
-
-             // Nodes
-             renderedKeypoints.forEach((k, idx) => {
-                 if (k.score > 0.6) {
-                     const kx = k.x + shiftX;
-                     const ky = k.y + shiftY;
-                     
-                     ctx.fillStyle = '#000';
-                     ctx.strokeStyle = baseColor;
-                     ctx.lineWidth = 1.5;
-                     ctx.beginPath();
-                     ctx.arc(kx, ky, 4 * depthScale, 0, Math.PI * 2);
-                     ctx.fill();
-                     ctx.stroke();
-                 }
-             });
-
-        } else {
-             // --- BOX RENDERING ---
-             if (!isWireframe) {
-                 ctx.fillStyle = m.label === 'УГРОЗА' ? 'rgba(255, 0, 0, 0.15)' : (isMachine ? 'rgba(0, 255, 65, 0.1)' : 'rgba(255, 170, 0, 0.1)');
-                 ctx.beginPath(); ctx.moveTo(fl, fb); ctx.lineTo(bl, bb); ctx.lineTo(br, bb); ctx.lineTo(fr, fb); ctx.fill();
-             }
-
-             ctx.strokeStyle = isMachine || isWireframe ? 'rgba(0,255,65,0.8)' : 'rgba(255,170,0,0.3)';
-             ctx.lineWidth = isWireframe ? 2 : 1;
-             ctx.beginPath();
-             ctx.moveTo(fl, ft); ctx.lineTo(bl, bt);
-             ctx.moveTo(fr, ft); ctx.lineTo(br, bt);
-             ctx.moveTo(fr, fb); ctx.lineTo(br, bb);
-             ctx.moveTo(fl, fb); ctx.lineTo(bl, bb);
-             ctx.stroke();
-             
-             if (!isWireframe) {
-                 ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-                 ctx.strokeRect(bl, bt, bw, bh);
-             }
-        }
-
-        // --- LABELS ---
-        if (m.label) {
-             const lx = fr + 10;
-             const ly = ft;
-             ctx.beginPath(); ctx.moveTo(fr, ft); ctx.lineTo(lx, ly - 20); ctx.lineTo(lx + 40, ly - 20);
-             ctx.strokeStyle = baseColor; ctx.lineWidth = 1; ctx.stroke();
-
-             ctx.fillStyle = baseColor;
-             ctx.font = 'bold ' + (12 * depthScale) + 'px monospace';
-             ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-             ctx.fillText(m.label, lx + 5, ly - 22);
-             
-             ctx.font = (10 * depthScale) + 'px monospace';
-             ctx.fillStyle = 'rgba(255,255,255,0.8)';
-             ctx.fillText((m.distance || '?') + 'M [' + Math.floor((m.confidence||0)*100) + '%]', lx, ly - 8);
-        }
+    state.forEach((v, id) => {
+        if (!activeIds.has(id)) v.active = false;
+        updateSecondOrder(v.x, v.targetX, dt);
+        updateSecondOrder(v.y, v.targetY, dt);
+        updateSecondOrder(v.w, v.targetW, dt);
+        updateSecondOrder(v.h, v.targetH, dt);
+        updateSecondOrder(v.dist, v.targetDist, dt);
+        if (v.op < 0.01 && !v.active) state.delete(id);
     });
-    
+
+    if (xr) {
+        renderView(0, 0, canvasW/2, canvasH, -15);
+        renderView(canvasW/2, 0, canvasW/2, canvasH, 15);
+    } else {
+        renderView(0, 0, canvasW, canvasH, 0);
+    }
     requestAnimationFrame(loop);
   }
 `;
 
-const VideoHUD: React.FC<VideoHUDProps> = React.memo(({ markers: aiMarkers, onVideoFrame, localStream, zoomLevel = 1, activeFilter = 'all', visualMode = 'normal' }) => {
+const VideoHUD: React.FC<VideoHUDProps> = React.memo(({ markers, onVideoFrame, onAddManualMarker, localStream, zoomLevel = 1, visualMode = 'normal', xrMode = false }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const workerRef = useRef<Worker | null>(null);
-  const snapshotCanvasRef = useRef<OffscreenCanvas | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const detectionServiceRef = useRef<ObjectDetectionService | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const detectionService = useRef<ObjectDetectionService | null>(null);
+  const sensors = useRef({ a: 0, b: 0, anchorA: 0, anchorB: 0, init: false });
 
-  // Loading State
-  const [loadingStatus, setLoadingStatus] = useState<{label: string, value: number} | null>({label: 'INIT', value: 0});
-
-  // 1. Initialize Render Worker
   useEffect(() => {
     if (!canvasRef.current) return;
-    const blob = new Blob([RENDER_WORKER_CODE], { type: 'text/javascript' });
-    const worker = new Worker(URL.createObjectURL(blob));
+    const worker = new Worker(URL.createObjectURL(new Blob([RENDER_WORKER_CODE], { type: 'application/javascript' })));
+    const offscreen = canvasRef.current.transferControlToOffscreen();
+    worker.postMessage({ type: 'INIT', payload: { canvas: offscreen } }, [offscreen]);
     workerRef.current = worker;
-    try {
-        const offscreen = canvasRef.current.transferControlToOffscreen();
-        worker.postMessage({ type: 'INIT', payload: { canvas: offscreen } }, [offscreen]);
-    } catch (e) { }
-    return () => { worker.terminate(); workerRef.current = null; };
-  }, []);
+    detectionService.current = new ObjectDetectionService();
+    detectionService.current.load();
 
-  // 2. Initialize Detection
-  useEffect(() => {
-      const service = new ObjectDetectionService();
-      detectionServiceRef.current = service;
-
-      service.onProgress = (label, value) => {
-          setLoadingStatus({ label, value });
-          if (value >= 1.0) {
-              setTimeout(() => setLoadingStatus(null), 1000);
-          }
-      };
-      service.load();
-      return () => {
-          service.dispose();
-          detectionServiceRef.current = null;
-      };
-  }, []);
-
-  // 3. Update Video
-  useEffect(() => {
-      if (videoRef.current && localStream) {
-          videoRef.current.srcObject = localStream;
-          videoRef.current.play().catch(e => console.log("Autoplay:", e));
+    const handleOri = (e: DeviceOrientationEvent) => {
+      const alpha = e.alpha || 0;
+      const beta = e.beta || 0;
+      if (!sensors.current.init && e.alpha !== null) {
+          sensors.current.anchorA = alpha; sensors.current.anchorB = beta;
+          sensors.current.init = true;
       }
-  }, [localStream]);
-
-  // 4. Handle Resize
-  useEffect(() => {
-    const handleResize = () => {
-        if (videoRef.current && workerRef.current) {
-            const rect = videoRef.current.getBoundingClientRect();
-            const dpr = window.devicePixelRatio || 1;
-            workerRef.current.postMessage({ type: 'RESIZE', payload: { width: rect.width * dpr, height: rect.height * dpr } });
-        }
+      sensors.current.a = alpha; sensors.current.b = beta;
+      workerRef.current?.postMessage({ type: 'UPDATE_SENSORS', payload: { ori: { alpha, beta }, zoom: zoomLevel } });
     };
-    const ro = new ResizeObserver(handleResize);
-    if (videoRef.current) ro.observe(videoRef.current);
-    return () => ro.disconnect();
-  }, []);
+    window.addEventListener('deviceorientation', handleOri, true);
+    return () => { 
+      worker.terminate(); 
+      window.removeEventListener('deviceorientation', handleOri); 
+      detectionService.current?.dispose(); 
+    };
+  }, [zoomLevel]);
 
-  // 5. Sensors & Modes
+  const handleHUDClick = useCallback((e: React.MouseEvent | React.TouchEvent) => {
+      if (!onAddManualMarker || xrMode) return;
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const clientX = 'touches' in e ? (e as React.TouchEvent).touches[0].clientX : (e as React.MouseEvent).clientX;
+      const clientY = 'touches' in e ? (e as React.TouchEvent).touches[0].clientY : (e as React.MouseEvent).clientY;
+      const nx = (clientX - rect.left) / rect.width;
+      const ny = (clientY - rect.top) / rect.height;
+      const currentFOV = 60 / zoomLevel;
+      let da = sensors.current.a - sensors.current.anchorA;
+      while (da > 180) da -= 360; while (da < -180) da += 360;
+      let db = sensors.current.b - sensors.current.anchorB;
+      const worldOffsetX = da / currentFOV;
+      const worldOffsetY = db / (currentFOV * (rect.height/rect.width));
+      onAddManualMarker(nx + worldOffsetX, ny + worldOffsetY);
+  }, [onAddManualMarker, xrMode, zoomLevel]);
+
+  useEffect(() => { 
+    workerRef.current?.postMessage({ type: 'UPDATE_MODE', payload: { mode: visualMode, xr: xrMode } }); 
+  }, [visualMode, xrMode]);
+  
+  useEffect(() => { if (videoRef.current && localStream) videoRef.current.srcObject = localStream; }, [localStream]);
+
   useEffect(() => {
-      const handleOrientation = (event: DeviceOrientationEvent) => {
-          if (workerRef.current) {
-              workerRef.current.postMessage({ type: 'UPDATE_SENSORS', payload: { orientation: { alpha: event.alpha || 0, beta: event.beta || 0, gamma: event.gamma || 0 }, zoom: zoomLevel } });
+    let frameId: number, lastFrameTime = 0;
+    const process = async (time: number) => {
+      if (videoRef.current?.readyState >= 2 && detectionService.current) {
+        const local = await detectionService.current.detect(videoRef.current, { a: sensors.current.a, b: sensors.current.b }) || [];
+        workerRef.current?.postMessage({ type: 'UPDATE_MARKERS', payload: [...local, ...markers] });
+
+        if (time - lastFrameTime > 1200) { 
+          const c = document.createElement('canvas'); c.width = 480; c.height = 270;
+          const ctx = c.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(videoRef.current, 0, 0, c.width, c.height);
+            onVideoFrame(c.toDataURL('image/jpeg', 0.5).split(',')[1]);
+            lastFrameTime = time;
           }
-      };
-      if (workerRef.current) workerRef.current.postMessage({ type: 'UPDATE_MODE', payload: visualMode });
-      window.addEventListener('deviceorientation', handleOrientation);
-      return () => window.removeEventListener('deviceorientation', handleOrientation);
-  }, [zoomLevel, visualMode]);
+        }
+      }
+      frameId = requestAnimationFrame(process);
+    };
+    frameId = requestAnimationFrame(process);
+    return () => cancelAnimationFrame(frameId);
+  }, [onVideoFrame, markers]);
 
-  // 6. Main Detection Loop (Corrected for Object-Cover)
-  useEffect(() => {
-    if (!snapshotCanvasRef.current && window.OffscreenCanvas) {
-        snapshotCanvasRef.current = new OffscreenCanvas(480, 360);
+  const getFilterStyle = () => {
+    switch (visualMode) {
+      case 'thermal': return 'contrast(1.5) brightness(1.2) hue-rotate(180deg) invert(1) grayscale(0.5) saturate(2)';
+      case 'night': return 'brightness(1.5) sepia(1) hue-rotate(70deg) saturate(3)';
+      case 'machine': return 'brightness(1.1) contrast(1.2) saturate(0.5) sepia(0.2) hue-rotate(150deg)';
+      default: return 'none';
     }
-
-    let isMounted = true;
-    let lastFrameTime = 0;
-    const FRAME_SEND_INTERVAL = 800; 
-
-    const processFrame = async () => {
-        if (!isMounted) return;
-        
-        const video = videoRef.current;
-        const detectionService = detectionServiceRef.current;
-        
-        if (video && video.readyState >= 2 && detectionService) {
-             const rawMarkers = await detectionService.detect(video);
-             
-             // --- FIX COORDINATE MAPPING FOR OBJECT-COVER ---
-             const rect = video.getBoundingClientRect();
-             const screenW = rect.width;
-             const screenH = rect.height;
-             const vidW = video.videoWidth;
-             const vidH = video.videoHeight;
-
-             // Calculate scaling to fill container (object-cover)
-             const scale = Math.max(screenW / vidW, screenH / vidH);
-             // Offsets to center video
-             const offsetX = (screenW - vidW * scale) / 2;
-             const offsetY = (screenH - vidH * scale) / 2;
-             
-             const processedMarkers: Marker[] = [];
-             const filterVal = activeFilter; 
-             const matchesFilter = (label: string) => {
-                if (filterVal === 'all') return true;
-                if (filterVal === 'person' && (label === 'ЧЕЛОВЕК' || label === 'ЛИЦО' || label === 'РЕЧЬ' || label === 'ТЕЛО')) return true;
-                if (filterVal === 'vehicle' && ['АВТО', 'ГРУЗ', 'АВТОБУС'].includes(label)) return true;
-                return false;
-             };
-
-             rawMarkers.forEach(m => {
-                 if (matchesFilter(m.label)) {
-                     // Transform logic: 
-                     // m.x is original pixel in Video.
-                     // displayedPixel = (originalPixel * scale) + offset
-                     
-                     // Helper for points
-                     const transformX = (x: number) => (x * scale) + offsetX;
-                     const transformY = (y: number) => (y * scale) + offsetY;
-
-                     processedMarkers.push({
-                         ...m,
-                         x: transformX(m.x),
-                         y: transformY(m.y),
-                         width: (m.width || 0) * scale,
-                         height: (m.height || 0) * scale,
-                         keypoints: m.keypoints?.map(k => ({ ...k, x: transformX(k.x), y: transformY(k.y) })),
-                         contours: m.contours ? processContours(m.contours, scale, offsetX, offsetY) : undefined
-                     });
-                 }
-             });
-
-             // Merge AI markers (assuming 0-100 percentage)
-             aiMarkers.forEach(m => {
-                 let mx = m.x, my = m.y, mw = m.width || 0, mh = m.height || 0;
-                 if (mx <= 100) {
-                     mx = (mx / 100) * screenW;
-                     my = (my / 100) * screenH;
-                     mw = (mw / 100) * screenW;
-                     mh = (mh / 100) * screenH;
-                 }
-                 processedMarkers.push({ ...m, x: mx, y: my, width: mw, height: mh });
-             });
-
-             if (workerRef.current) {
-                 workerRef.current.postMessage({ type: 'UPDATE_MARKERS', payload: processedMarkers });
-             }
-
-             const now = Date.now();
-             if (now - lastFrameTime > FRAME_SEND_INTERVAL) {
-                 lastFrameTime = now;
-                 const osc = snapshotCanvasRef.current;
-                 if (osc) {
-                     const ctx = osc.getContext('2d', { willReadFrequently: true });
-                     if (ctx) {
-                         ctx.drawImage(video, 0, 0, osc.width, osc.height);
-                         osc.convertToBlob({ type: 'image/jpeg', quality: 0.4 }).then(blob => {
-                             if (!isMounted) return;
-                             const reader = new FileReader();
-                             reader.onloadend = () => {
-                                 const base64 = (reader.result as string)?.split(',')[1];
-                                 if (base64) onVideoFrame(base64);
-                             };
-                             reader.readAsDataURL(blob);
-                         }).catch(() => {});
-                     }
-                 }
-             }
-        }
-        
-        requestAnimationFrame(processFrame);
-    };
-
-    requestAnimationFrame(processFrame);
-    return () => { isMounted = false; };
-  }, [aiMarkers, activeFilter, onVideoFrame]); 
-
-  const processContours = (contours: any, scale: number, offX: number, offY: number) => {
-      const processed: any = {};
-      for(const [key, points] of Object.entries(contours)) {
-          processed[key] = (points as any[]).map(p => ({
-              x: (p.x * scale) + offX,
-              y: (p.y * scale) + offY
-          }));
-      }
-      return processed;
   };
 
-  let videoFilter = 'none';
-  if (visualMode === 'night') videoFilter = 'grayscale(100%) sepia(100%) hue-rotate(90deg) brightness(1.2) contrast(1.1)'; 
-  else if (visualMode === 'thermal') videoFilter = 'grayscale(100%) contrast(1.5) brightness(0.8) sepia(100%) hue-rotate(-50deg)'; 
-  else if (visualMode === 'matrix') videoFilter = 'grayscale(100%) brightness(0.8) contrast(1.5)'; 
-  else if (visualMode === 'machine') videoFilter = 'grayscale(100%) invert(100%) contrast(150%) brightness(0.2)'; 
-
   return (
-    <div className="relative w-full h-full bg-black flex justify-center items-center overflow-hidden">
-      <div 
-        ref={containerRef}
-        className="absolute w-full h-full transition-transform duration-100 ease-out will-change-transform"
-        style={{ transformStyle: 'preserve-3d' }}
-      >
-          <div className="absolute w-full h-full" style={{ transform: 'translateZ(-50px)', backfaceVisibility: 'hidden' }}>
-            <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className={`w-full h-full object-cover transition-opacity duration-300 ${visualMode === 'wireframe' ? 'opacity-0' : 'opacity-100'}`}
-                style={{ filter: videoFilter }} 
-            />
-          </div>
-          <canvas
-            ref={canvasRef}
-            className="absolute w-full h-full object-cover pointer-events-none z-10"
-            style={{ transform: 'translateZ(0px)' }}
-          />
-      </div>
-
-      <div className="absolute inset-0 pointer-events-none z-20">
-          <div className="scanline"></div>
-          <div className={`vignette w-full h-full ${visualMode === 'night' ? 'bg-green-900/10' : ''}`}></div>
-      </div>
-      
-      {/* Loading Progress Bars */}
-      {loadingStatus && (
-          <div className="absolute top-20 right-4 w-48 z-40 flex flex-col items-end gap-1 pointer-events-none animate-pulse">
-              <div className="text-[10px] text-orange-500 font-bold bg-black/70 px-2 py-1 pixel-text-shadow">
-                  SYSTEM_BOOT: {loadingStatus.label}
+    <div ref={containerRef} className={`absolute inset-0 w-full h-full overflow-hidden bg-black ${xrMode ? '' : 'cursor-crosshair'}`} onClick={handleHUDClick}>
+      {xrMode ? (
+          <div className="flex w-full h-full">
+              <div className="w-1/2 h-full overflow-hidden border-r border-white/10">
+                <video autoPlay playsInline muted className="w-full h-full object-cover transition-all" style={{ transform: `scale(${zoomLevel})`, filter: getFilterStyle() }} onLoadedMetadata={(e) => { (e.target as HTMLVideoElement).srcObject = localStream; }} />
               </div>
-              <div className="w-full h-2 bg-gray-900 border border-orange-900">
-                  <div 
-                      className="h-full bg-orange-500 transition-all duration-200"
-                      style={{ width: `${(loadingStatus.value || 0) * 100}%` }}
-                  />
+              <div className="w-1/2 h-full overflow-hidden">
+                <video autoPlay playsInline muted className="w-full h-full object-cover transition-all" style={{ transform: `scale(${zoomLevel})`, filter: getFilterStyle() }} onLoadedMetadata={(e) => { (e.target as HTMLVideoElement).srcObject = localStream; }} />
               </div>
           </div>
+      ) : (
+          <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover transition-all" style={{ transform: `scale(${zoomLevel})`, filter: getFilterStyle() }} />
+      )}
+      <canvas ref={canvasRef} width={window.innerWidth} height={window.innerHeight} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
+      <div className={`absolute inset-0 pointer-events-none z-20 mix-blend-overlay transition-opacity duration-500 ${
+        visualMode === 'thermal' ? 'bg-indigo-900/40 opacity-80' : visualMode === 'night' ? 'bg-green-500/10 opacity-50' : 'opacity-0'
+      }`} />
+      {(visualMode === 'thermal' || visualMode === 'night') && (
+        <div className="absolute inset-0 pointer-events-none z-20 opacity-20 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] mix-blend-screen" />
       )}
     </div>
   );

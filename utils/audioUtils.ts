@@ -1,10 +1,9 @@
 
-
 export const AUDIO_WORKLET_CODE = `
 class MicProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.bufferSize = 1024; // ~42ms at 24kHz
+    this.bufferSize = 1024;
     this.buffer = new Float32Array(this.bufferSize);
     this.index = 0;
   }
@@ -45,12 +44,11 @@ export function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
-// Optimized ArrayBuffer to Base64 (avoids call stack size exceeded on large buffers)
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
   let binary = '';
   const bytes = new Uint8Array(buffer);
   const len = bytes.byteLength;
-  const chunkSize = 0x8000; // 32KB chunks
+  const chunkSize = 0x8000;
   
   for (let i = 0; i < len; i += chunkSize) {
     binary += String.fromCharCode.apply(
@@ -88,7 +86,11 @@ export async function decodeAudioData(
   ctx: AudioContext,
   sampleRate: number = 24000
 ): Promise<AudioBuffer> {
-    const dataInt16 = new Int16Array(data.buffer);
+    // Gemini can return an odd number of bytes. Int16Array requires a multiple of 2.
+    const validLength = data.length - (data.length % 2);
+    if (validLength === 0) return ctx.createBuffer(1, 1, sampleRate);
+
+    const dataInt16 = new Int16Array(data.buffer, data.byteOffset, validLength / 2);
     const float32 = new Float32Array(dataInt16.length);
     for(let i=0; i<dataInt16.length; i++) {
         float32[i] = dataInt16[i] / 32768.0;
