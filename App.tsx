@@ -20,38 +20,85 @@ const App: React.FC = () => {
   const [zoomLevel, setZoomLevel] = useState<number>(1);
   const [visualMode, setVisualMode] = useState<'normal' | 'night' | 'thermal' | 'machine' | 'wireframe'>('normal');
   const [xrEnabled, setXrEnabled] = useState(false);
+  const [isBooted, setIsBooted] = useState(false);
+  const [permError, setPermError] = useState<string | null>(null);
 
   const audioCanvasRef = useRef<HTMLCanvasElement>(null);
   const geminiRef = useRef<GeminiService | null>(null);
 
-  useEffect(() => {
+  const initCamera = useCallback(async () => {
+    if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode, width: { ideal: 1920 }, height: { ideal: 1080 } }, 
+            audio: false 
+        });
+        setLocalStream(stream);
+        return true;
+    } catch (e) {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            setLocalStream(stream);
+            return true;
+        } catch (err: any) {
+            console.error('Camera failed:', err);
+            setPermError("CAMERA ACCESS DENIED");
+            return false;
+        }
+    }
+  }, [facingMode, localStream]);
+
+  const toggleGemini = useCallback(async () => {
+    if (status === ConnectionStatus.CONNECTED) { 
+        geminiRef.current?.disconnect(); 
+        return; 
+    }
     if (!geminiRef.current) {
         geminiRef.current = new GeminiService();
-        setTimeout(() => toggleGemini(), 500);
     }
-    return () => geminiRef.current?.disconnect();
-  }, []);
+    
+    geminiRef.current.onStatusChange = setStatus;
+    geminiRef.current.onCameraCommand = handleCameraCommand;
+    geminiRef.current.onTranscript = (text, source, isFinal) => {
+        setTranscripts(prev => {
+            const existingIdx = prev.findIndex(t => t.source === source && !t.isFinal);
+            if (existingIdx !== -1) {
+                const next = [...prev];
+                next[existingIdx] = { ...next[existingIdx], text, isFinal };
+                if (isFinal) {
+                    const idToKill = next[existingIdx].id;
+                    setTimeout(() => setTranscripts(curr => curr.filter(t => t.id !== idToKill)), 5000);
+                }
+                return next;
+            }
+            const id = Math.random().toString(36).substr(2, 9);
+            if (isFinal) setTimeout(() => setTranscripts(curr => curr.filter(t => t.id !== id)), 5000);
+            return [...prev, { id, text, source, isFinal }];
+        });
+    };
+
+    try { 
+      await geminiRef.current.connect(); 
+    } catch (err) { 
+      setStatus(ConnectionStatus.ERROR); 
+      setPermError("MIC ACCESS DENIED OR API ERROR");
+    }
+  }, [status]);
+
+  const bootSystem = async () => {
+    const camOk = await initCamera();
+    if (camOk) {
+        setIsBooted(true);
+        // Automatically start Gemini after successful camera boot
+        await toggleGemini();
+    }
+  };
 
   useEffect(() => {
-    let isMounted = true;
-    const initCamera = async () => {
-        if (localStream) localStream.getTracks().forEach(t => t.stop());
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ 
-                video: { facingMode, width: { ideal: 1920 }, height: { ideal: 1080 } }, 
-                audio: false 
-            });
-            if (isMounted) setLocalStream(stream);
-        } catch (e) {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-                if (isMounted) setLocalStream(stream);
-            } catch (err) { console.error('Camera failed:', err); }
-        }
-    };
-    initCamera();
-    return () => { isMounted = false; };
-  }, [facingMode]);
+    return () => geminiRef.current?.disconnect();
+  }, []);
 
   const handleCameraCommand = useCallback((cmd: CameraCommand) => {
       switch (cmd.type) {
@@ -88,39 +135,6 @@ const App: React.FC = () => {
         geminiRef.current?.sendVideoFrame(base64);
     }
   }, [status]);
-
-  const toggleGemini = useCallback(async () => {
-    if (status === ConnectionStatus.CONNECTED) { 
-        geminiRef.current?.disconnect(); 
-        return; 
-    }
-    if (geminiRef.current) {
-        geminiRef.current.onStatusChange = setStatus;
-        geminiRef.current.onCameraCommand = handleCameraCommand;
-        geminiRef.current.onTranscript = (text, source, isFinal) => {
-            setTranscripts(prev => {
-                const existingIdx = prev.findIndex(t => t.source === source && !t.isFinal);
-                if (existingIdx !== -1) {
-                    const next = [...prev];
-                    next[existingIdx] = { ...next[existingIdx], text, isFinal };
-                    if (isFinal) {
-                        const idToKill = next[existingIdx].id;
-                        setTimeout(() => setTranscripts(curr => curr.filter(t => t.id !== idToKill)), 5000);
-                    }
-                    return next;
-                }
-                const id = Math.random().toString(36).substr(2, 9);
-                if (isFinal) setTimeout(() => setTranscripts(curr => curr.filter(t => t.id !== id)), 5000);
-                return [...prev, { id, text, source, isFinal }];
-            });
-        };
-        try { 
-          await geminiRef.current.connect(); 
-        } catch (err) { 
-          setStatus(ConnectionStatus.ERROR); 
-        }
-    }
-  }, [status, handleCameraCommand]);
 
   const handleKeySelect = useCallback(() => {
     geminiRef.current?.openKeyDialog();
@@ -162,65 +176,96 @@ const App: React.FC = () => {
 
   return (
     <div className={`relative w-screen h-[100dvh] bg-black overflow-hidden font-mono text-[10px] ${xrEnabled ? 'xr-stereo' : ''}`}>
-      <VideoHUD 
-        markers={markers} 
-        localStream={localStream} 
-        zoomLevel={zoomLevel} 
-        visualMode={visualMode} 
-        onVideoFrame={onVideoFrame}
-        onAddManualMarker={handleAddManualMarker}
-        xrMode={xrEnabled}
-      />
       
-      <div className={`absolute inset-0 pointer-events-none z-30 flex ${xrEnabled ? 'flex-row' : ''}`}>
-          {[0, ...(xrEnabled ? [1] : [])].map((viewIdx) => (
-            <div key={viewIdx} className={`relative h-full flex-grow flex flex-col p-4 pt-safe ${xrEnabled ? 'border-r border-white/10' : ''}`}>
-                <div className="flex justify-between items-start pointer-events-none">
-                    <div className="flex flex-col gap-1 pointer-events-auto">
-                        <h1 className={`text-xl font-black ${visualMode === 'machine' ? 'text-green-500' : 'text-orange-500'} pixel-text-shadow tracking-tighter`}>
-                            ВИЖН<span className="text-white">ОС</span><span className="text-[7px] ml-1 opacity-40">2.5_PRO</span>
-                        </h1>
-                        <div className={`text-[7px] px-2 py-0.5 inline-block uppercase tracking-widest border-l-2 ${
-                            status === ConnectionStatus.CONNECTED ? 'bg-green-900/40 text-green-400 border-green-500' :
-                            status === ConnectionStatus.CONNECTING ? 'bg-blue-900/40 text-blue-400 border-blue-500' :
-                            'bg-black/40 text-white/60 border-orange-500'
-                        }`}>
-                            СТАТУС: {status} | РЕЖИМ: {visualMode} | ЗУМ: {zoomLevel.toFixed(1)}x
+      {!isBooted ? (
+          <div className="absolute inset-0 z-[100] flex flex-col items-center justify-center bg-black/95 text-orange-500 p-8 text-center">
+              <div className="mb-4 text-4xl font-black pixel-text-shadow animate-pulse">VISION OS</div>
+              <div className="mb-8 text-xs max-w-xs opacity-80 uppercase tracking-widest">
+                  Система требует доступа к камере и микрофону для работы HUD и ИИ-оператора.
+              </div>
+              
+              {permError ? (
+                  <div className="mb-6 p-4 border border-red-500 bg-red-900/20 text-red-500 animate-bounce uppercase">
+                      Ошибка: {permError}
+                      <br/>
+                      <span className="text-[8px] opacity-70">Проверьте настройки браузера</span>
+                  </div>
+              ) : null}
+
+              <button 
+                onClick={bootSystem}
+                className="px-8 py-4 border-2 border-orange-500 hover:bg-orange-500 hover:text-black transition-all font-bold text-lg active:scale-95"
+              >
+                  ЗАГРУЗИТЬ СИСТЕМУ
+              </button>
+              <div className="mt-8 text-[8px] opacity-40 uppercase">v2.5.0-STABLE // BUILD 2025.04.12</div>
+          </div>
+      ) : (
+          <>
+            <VideoHUD 
+                markers={markers} 
+                localStream={localStream} 
+                zoomLevel={zoomLevel} 
+                visualMode={visualMode} 
+                onVideoFrame={onVideoFrame}
+                onAddManualMarker={handleAddManualMarker}
+                xrMode={xrEnabled}
+            />
+            
+            <div className={`absolute inset-0 pointer-events-none z-30 flex ${xrEnabled ? 'flex-row' : ''}`}>
+                {[0, ...(xrEnabled ? [1] : [])].map((viewIdx) => (
+                    <div key={viewIdx} className={`relative h-full flex-grow flex flex-col p-4 pt-safe ${xrEnabled ? 'border-r border-white/10' : ''}`}>
+                        <div className="flex justify-between items-start pointer-events-none">
+                            <div className="flex flex-col gap-1 pointer-events-auto">
+                                <h1 className={`text-xl font-black ${visualMode === 'machine' ? 'text-green-500' : 'text-orange-500'} pixel-text-shadow tracking-tighter`}>
+                                    ВИЖН<span className="text-white">ОС</span><span className="text-[7px] ml-1 opacity-40">2.5_PRO</span>
+                                </h1>
+                                <div className={`text-[7px] px-2 py-0.5 inline-block uppercase tracking-widest border-l-2 ${
+                                    status === ConnectionStatus.CONNECTED ? 'bg-green-900/40 text-green-400 border-green-500' :
+                                    status === ConnectionStatus.CONNECTING ? 'bg-blue-900/40 text-blue-400 border-blue-500' :
+                                    'bg-black/40 text-white/60 border-orange-500'
+                                }`}>
+                                    СТАТУС: {status} | РЕЖИМ: {visualMode} | ЗУМ: {zoomLevel.toFixed(1)}x
+                                </div>
+                                
+                                <div className="mt-2 bg-black/50 p-1 border border-orange-500/10 backdrop-blur-sm">
+                                    <canvas ref={viewIdx === 0 ? audioCanvasRef : undefined} width={120} height={25} className="opacity-80" />
+                                </div>
+                            </div>
+                            
+                            {viewIdx === 0 && (
+                                <div className="flex gap-2 pointer-events-auto items-center">
+                                    <button onClick={() => setFacingMode(prev => prev === 'user' ? 'environment' : 'user')} className="p-2 bg-black/40 border border-orange-500/20 text-orange-500">
+                                        <i className="fas fa-camera-rotate" />
+                                    </button>
+                                    <button onClick={() => setXrEnabled(!xrEnabled)} className={`p-2 border transition-all ${xrEnabled ? 'bg-orange-500 text-black border-orange-500' : 'bg-black/40 border-orange-500/20 text-orange-500'}`}>
+                                        <i className="fas fa-vr-cardboard" />
+                                    </button>
+                                    <button onClick={handleKeySelect} className="p-2 text-white bg-blue-900/40 border border-blue-500/20">
+                                        <i className="fas fa-key text-[9px]" />
+                                    </button>
+                                    <button onClick={toggleGemini} className={`p-2 border transition-all ${status === ConnectionStatus.CONNECTED ? 'bg-red-900/80 border-red-500' : 'bg-black/40 border-orange-500/20'}`}>
+                                        <i className={`fas ${status === ConnectionStatus.CONNECTED ? 'fa-stop' : 'fa-microphone'}`} />
+                                    </button>
+                                </div>
+                            )}
                         </div>
-                        
-                        <div className="mt-2 bg-black/50 p-1 border border-orange-500/10 backdrop-blur-sm">
-                            <canvas ref={viewIdx === 0 ? audioCanvasRef : undefined} width={120} height={25} className="opacity-80" />
+
+                        <div className="mt-auto mb-10 flex flex-col items-center w-full max-w-lg mx-auto">
+                            {transcripts.map(t => (
+                                <div key={t.id} className={`mb-2 px-4 py-2 bg-black/80 border-l-4 ${t.source === 'ai' ? 'border-orange-500' : 'border-blue-500'} shadow-lg`}>
+                                    <div className="text-white uppercase pixel-text-shadow leading-tight text-[10px] tracking-tight">
+                                        <span className="text-[7px] opacity-50 block mb-1">{t.source === 'ai' ? 'ОПЕРАТОР' : 'ВЫ'}:</span>
+                                        {t.text}{!t.isFinal && <span className="animate-pulse">_</span>}
+                                    </div>
+                                </div>
+                            ))}
                         </div>
                     </div>
-                    
-                    {viewIdx === 0 && (
-                        <div className="flex gap-2 pointer-events-auto items-center">
-                            <button onClick={() => setXrEnabled(!xrEnabled)} className={`p-2 border transition-all ${xrEnabled ? 'bg-orange-500 text-black border-orange-500' : 'bg-black/40 border-orange-500/20 text-orange-500'}`}>
-                                <i className="fas fa-vr-cardboard" />
-                            </button>
-                            <button onClick={handleKeySelect} className="p-2 text-white bg-blue-900/40 border border-blue-500/20">
-                                <i className="fas fa-key text-[9px]" />
-                            </button>
-                            <button onClick={toggleGemini} className={`p-2 border transition-all ${status === ConnectionStatus.CONNECTED ? 'bg-red-900/80 border-red-500' : 'bg-black/40 border-orange-500/20'}`}>
-                                <i className={`fas ${status === ConnectionStatus.CONNECTED ? 'fa-stop' : 'fa-microphone'}`} />
-                            </button>
-                        </div>
-                    )}
-                </div>
-
-                <div className="mt-auto mb-10 flex flex-col items-center w-full max-w-lg mx-auto">
-                    {transcripts.map(t => (
-                        <div key={t.id} className={`mb-2 px-4 py-2 bg-black/80 border-l-4 ${t.source === 'ai' ? 'border-orange-500' : 'border-blue-500'} shadow-lg`}>
-                            <div className="text-white uppercase pixel-text-shadow leading-tight text-[10px] tracking-tight">
-                                <span className="text-[7px] opacity-50 block mb-1">{t.source === 'ai' ? 'ОПЕРАТОР' : 'ВЫ'}:</span>
-                                {t.text}{!t.isFinal && <span className="animate-pulse">_</span>}
-                            </div>
-                        </div>
-                    ))}
-                </div>
+                ))}
             </div>
-          ))}
-      </div>
+          </>
+      )}
 
       <style>{`
         .pt-safe { padding-top: max(1rem, env(safe-area-inset-top)); }
